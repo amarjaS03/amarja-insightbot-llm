@@ -8,6 +8,8 @@ _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _v1 = os.path.join(_repo_root, "v1")
 if _v1 not in sys.path:
     sys.path.insert(0, _v1)
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
 
 # Load repo .env before ExecutionApi reads DATA_DIR / GCS_BUCKET (required locally and on Cloud Run).
 try:
@@ -26,6 +28,10 @@ os.environ["DATA_DIR"] = _data_dir
 
 if not (os.getenv("GCS_BUCKET") or "").strip():
     os.environ["GCS_BUCKET"] = "local-dev-bucket"
+
+from execution_layer.runtime_io import ensure_terminal_friendly_io
+
+ensure_terminal_friendly_io()
 
 from execution_api import ExecutionApi
 from logger import add_log

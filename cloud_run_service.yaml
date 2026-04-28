@@ -25,6 +25,8 @@ spec:
             - name: gcs-volume
               mountPath: /data
           env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
             - name: GCS_BUCKET
               value: BUCKET_PLACEHOLDER
             - name: DATA_DIR

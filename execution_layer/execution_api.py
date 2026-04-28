@@ -20,6 +20,8 @@ from firebase_admin import firestore as firebase_firestore
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from execution_layer.runtime_io import ensure_terminal_friendly_io
+
 # Import analysis components
 from execution_layer.agents.data_analysis_agent import DataAnalysisAgent
 from execution_layer.agents.llm_client import initialize_client
@@ -121,6 +123,7 @@ cancellation_manager = CancellationManager()
 
 class ExecutionApi:
     def __init__(self):
+        ensure_terminal_friendly_io()
         self.app = Flask(__name__)
         CORS(self.app)
         
@@ -128,6 +131,7 @@ class ExecutionApi:
         # This creates a client connection (not server) to avoid conflicts
         self.sio_client = socketio.SimpleClient()
         self.api_layer_connected = False
+        self._sio_lock = threading.Lock()
 
         # Cloud Run / GCS FUSE configuration (REQUIRED for v2 - Cloud Run only)
         # - cloud_run_service.yaml sets: GCS_BUCKET, DATA_DIR, api_layer_url
@@ -267,58 +271,76 @@ class ExecutionApi:
     
     def connect_to_api_layer(self, max_retries=5):
         """
-        Connect to API layer's SocketIO server for progress streaming with retry logic.
-        
-        Cloud Run only: Requires API_LAYER_URL/api_layer_url environment variable to be set.
-        This URL should point to the v2 API layer (e.g., Cloudflare tunnel URL during development, 
-        or App Engine URL in production).
+        Connect to API layer Socket.IO for progress streaming.
+
+        Requires API_LAYER_URL. v2 serves Engine.IO at /socket.io (alias /socketio).
+        Optional: EXECUTION_SOCKETIO_PATH (e.g. socket.io or socketio, no leading slash).
         """
+        return self._connect_to_api_layer_unlocked(
+            max_retries=max_retries, sleep_between_rounds=True
+        )
+
+    def _connect_to_api_layer_unlocked(
+        self, *, max_retries: int = 5, sleep_between_rounds: bool = True
+    ) -> bool:
         if not self.api_layer_url:
-            # print(f"[EXECUTION LAYER] ⚠️ Cannot connect: API_LAYER_URL not set")
             return False
-        
-        retry_count = 0
-        base_delay = 1  # 1 second
-        
-        # while retry_count < max_retries:
-        #     try:
-        #         if not self.api_layer_connected:
-        #             # Ensure URL has no trailing slash for SocketIO
-        #             # Use custom SocketIO path /socketio for v2 standalone API.
-        #             api_url = self.api_layer_url.rstrip('/')
-        #             socketio_url = f"{api_url}/socketio"
-        #             print(f"[EXECUTION LAYER] 🔗 Connecting to API layer SocketIO at {socketio_url} (attempt {retry_count + 1}/{max_retries})")
-                    
-        #             # Use longer timeout for tunnel connections and allow both websocket and polling transports
-        #             self.sio_client.connect(
-        #                 api_url,
-        #                 socketio_path='socketio',
-        #                 wait_timeout=20,  # Increased timeout for tunnel connections
-        #                 transports=['websocket', 'polling']
-        #             )
-                    
-        #             self.api_layer_connected = True
-        #             print(f"[EXECUTION LAYER] ✅ Connected to API layer SocketIO at {socketio_url}")
-        #             return True
-        #         else:
-        #             return True
-        #     except Exception as e:
-        #         retry_count += 1
-        #         error_msg = str(e)
-        #         # Truncate long error messages for readability
-        #         if len(error_msg) > 200:
-        #             error_msg = error_msg[:200] + "..."
-        #         print(f"[EXECUTION LAYER] ❌ Failed to connect to API layer (attempt {retry_count}/{max_retries}): {error_msg}")
-                
-                # if retry_count < max_retries:
-                #     delay = base_delay * (2 ** (retry_count - 1))  # Exponential backoff
-                #     print(f"[EXECUTION LAYER] ⏳ Retrying connection in {delay} seconds...")
-                #     time.sleep(delay)
-                # else:
-                #     print(f"[EXECUTION LAYER] ❌ Max connection retries reached, giving up")
-                #     self.api_layer_connected = False
-                #     return False
-        
+
+        with self._sio_lock:
+            if self.api_layer_connected:
+                return True
+
+        api_url = self.api_layer_url.rstrip("/")
+        base_delay = 1.0
+        env_path = (os.getenv("EXECUTION_SOCKETIO_PATH") or "").strip().lstrip("/")
+        path_candidates: list[str] = []
+        if env_path:
+            path_candidates.append(env_path)
+        for p in ("socket.io", "socketio"):
+            if p not in path_candidates:
+                path_candidates.append(p)
+
+        for attempt in range(max_retries):
+            for sock_path in path_candidates:
+                try:
+                    with self._sio_lock:
+                        if self.api_layer_connected:
+                            return True
+                        try:
+                            self.sio_client.disconnect()
+                        except Exception:
+                            pass
+                        self.sio_client = socketio.SimpleClient()
+                        print(
+                            f"[EXECUTION LAYER] 🔗 Socket.IO connect to {api_url} "
+                            f"(path={sock_path}, round {attempt + 1}/{max_retries})"
+                        )
+                        self.sio_client.connect(
+                            api_url,
+                            socketio_path=sock_path,
+                            wait_timeout=25,
+                            transports=["websocket", "polling"],
+                        )
+                        self.api_layer_connected = True
+                    print(f"[EXECUTION LAYER] ✅ Socket.IO connected (socketio_path={sock_path})")
+                    return True
+                except Exception as e:
+                    err = str(e)
+                    if len(err) > 220:
+                        err = err[:220] + "..."
+                    with self._sio_lock:
+                        self.api_layer_connected = False
+                    print(
+                        f"[EXECUTION LAYER] ❌ Socket.IO failed "
+                        f"(path={sock_path}, round {attempt + 1}/{max_retries}): {err}"
+                    )
+
+            if sleep_between_rounds and attempt + 1 < max_retries:
+                delay = min(30.0, base_delay * (2**attempt))
+                print(f"[EXECUTION LAYER] ⏳ Retrying Socket.IO in {delay:.1f}s...")
+                time.sleep(delay)
+
+        print("[EXECUTION LAYER] ❌ Socket.IO: max retries; live progress disabled (logs still print here)")
         return False
 
     def _create_milestone(self, job_id: str, name: str, description: str, data: dict = None):
@@ -355,36 +377,38 @@ class ExecutionApi:
             print(f"[EXECUTION LAYER] ⚠️ Milestone API error: {e}")
 
     def _emit_progress(self, job_id: str, stage: str, message: str, emoji: str = ""):
-        """Emit progress event for a job - RESTORED streaming through SocketIO client with reconnection handling"""
-        progress_event = ProgressEvent(job_id, stage, message, 0, emoji)  # Set percentage to 0 since we don't need it
-        
-        # Emit progress to API layer via SocketIO client
+        """Emit progress to API layer via Socket.IO; always mirror to stdout for the container terminal."""
+        progress_event = ProgressEvent(job_id, stage, message, 0, emoji)
+        payload = progress_event.to_dict()
+
+        # Terminal mirror (independent of Socket.IO) so operators always see analysis steps.
+        print(f"[EXECUTION LAYER] {emoji} {stage}: {message}", flush=True)
+
+        with self._sio_lock:
+            need_connect = not self.api_layer_connected
+        if need_connect:
+            self._connect_to_api_layer_unlocked(max_retries=1, sleep_between_rounds=False)
+
         try:
-            if self.api_layer_connected:
-                # Emit to API layer which will forward to frontend
-                self.sio_client.emit('execution_progress', progress_event.to_dict())
-                print(f"[EXECUTION LAYER] 📡 Progress streamed: {emoji} {stage}: {message}")
-            else:
-                # Try to reconnect if not connected
-                print(f"[EXECUTION LAYER] 🔄 Connection lost, attempting to reconnect...")
-                if self.connect_to_api_layer():
-                    self.sio_client.emit('execution_progress', progress_event.to_dict())
-                    print(f"[EXECUTION LAYER] 📡 Progress streamed after reconnection: {emoji} {stage}: {message}")
-                else:
-                    print(f"[EXECUTION LAYER] ⚠️  Progress (no connection): {emoji} {stage}: {message}")
+            with self._sio_lock:
+                if self.api_layer_connected:
+                    self.sio_client.emit("execution_progress", payload)
+                    return
         except Exception as e:
-            print(f"[EXECUTION LAYER] ❌ Error emitting progress: {e}")
-            # Mark connection as disconnected and try to reconnect
-            self.api_layer_connected = False
-            try:
-                if self.connect_to_api_layer():
-                    self.sio_client.emit('execution_progress', progress_event.to_dict())
-                    print(f"[EXECUTION LAYER] 📡 Progress streamed after error recovery: {emoji} {stage}: {message}")
-                else:
-                    print(f"[EXECUTION LAYER] 📝 Progress (fallback): {emoji} {stage}: {message}")
-            except Exception as retry_error:
-                print(f"[EXECUTION LAYER] ❌ Retry failed: {retry_error}")
-                print(f"[EXECUTION LAYER] 📝 Progress (fallback): {emoji} {stage}: {message}")
+            print(f"[EXECUTION LAYER] ❌ Error emitting progress: {e}", flush=True)
+            with self._sio_lock:
+                self.api_layer_connected = False
+
+        try:
+            self._connect_to_api_layer_unlocked(max_retries=3, sleep_between_rounds=False)
+            with self._sio_lock:
+                if self.api_layer_connected:
+                    self.sio_client.emit("execution_progress", payload)
+                    return
+        except Exception as retry_error:
+            print(f"[EXECUTION LAYER] ❌ Progress reconnect failed: {retry_error}", flush=True)
+            with self._sio_lock:
+                self.api_layer_connected = False
     
     # REMOVED: register_socketio_events() - no longer needed since we removed the SocketIO instance
     # All WebSocket communication now handled by main API layer
