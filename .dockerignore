@@ -1,0 +1,28 @@
+.git
+.gitignore
+.cursor
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Logs and local artifacts
+*.log
+run.log
+debug.log
+
+# Local data (avoid sending huge build context)
+sample_data
+vendor
+
+# Notebooks / misc
+*.ipynb
+
+# Local env
+.env
+.venv
+venv
+env

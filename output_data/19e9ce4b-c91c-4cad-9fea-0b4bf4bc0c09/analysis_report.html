@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Data Analysis Report</title>
+<style>
+    .mck-report {
+      font-family: Arial, Helvetica, sans-serif;
+      background: #f8f9fa;
+      margin: 40px;
+      color: #333;
+    }
+    .mck-container {
+      margin: auto;
+      background: #fff;
+      border-radius: 8px;
+    }
+    .mck-title {
+      font-size: 24px;
+      margin-bottom: 10px;
+      color: #222;
+    }
+    .mck-subtitle {
+      font-size: 20px;
+      margin-top: 20px;
+      color: #b00020;
+    }
+    .mck-text {
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .mck-error-box {
+      border-left: 4px solid #b00020;
+      background: #fff4f4;
+      padding: 15px;
+      margin-top: 15px;
+      border-radius: 4px;
+    }
+    .mck-strong {
+      color: #b00020;
+      font-weight: bold;
+    }
+    .mck-em {
+      font-style: italic;
+    }
+  </style>
+</head>
+<body>
+<div class="mck-report">
+<div class="mck-container">
+<h2 class="mck-subtitle">Generation Error</h2>
+<div class="mck-error-box">
+<p class="mck-text"><span class="mck-strong">Issue:</span> Something went wrong</p>
+<p class="mck-text">User <span class="mck-strong">Error code: 429 - {'error': {'message': 'You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors.', 'type': 'insufficient_quota', 'param': None, 'code': 'insufficient_quota'}}</span></p>
+<p class="mck-text"><span class="mck-em">Next step:</span> For more please reach out to your administrator</p>
+</div>
+</div>
+</div>
+</body>
+</html>

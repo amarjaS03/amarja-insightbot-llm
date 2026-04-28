@@ -1,0 +1,382 @@
+{
+    "marketing_action_types": {
+        "BACKEND_REPORT_ANALYSIS_STARTED": {
+            "actionType": "BACKEND_REPORT_ANALYSIS_STARTED",
+            "note": "From Backend, Report analysis started."
+        },
+        "BACKEND_REPORT_ANALYSIS_COMPLETE": {
+            "actionType": "BACKEND_REPORT_ANALYSIS_COMPLETE",
+            "note": "From Backend, Report analysis completed successfully."
+        },
+        "BACKEND_REPORT_ANALYSIS_FAILED": {
+            "actionType": "BACKEND_REPORT_ANALYSIS_FAILED",
+            "note": "From Backend, Report analysis failed."
+        }
+    },
+    "marketing_campaigns_logs_api_url": "https://us-central1-marketingcampaigndev.cloudfunctions.net/api/logs",
+    "auth_providers": [
+        "Google",
+        "Microsoft"
+    ],
+    "firebase_web_api_key": "AIzaSyDJ0lzWQR90l_vULEcAyACEo8QUpG1Bs8s",
+    "salesforce_token_url_prod": "https://login.salesforce.com/services/oauth2/token",
+    "jobs_file_path": "jobs.json",
+    "salesforce_base_url_prod": "https://login.salesforce.com/services/oauth2/authorize",
+    "salesforce_cloud_function_url": "https://us-central1-insightbot-dev-474509.cloudfunctions.net/zingworks_salesforce_connector",
+    "google_token_info_url": "https://oauth2.googleapis.com/tokeninfo",
+    "path_wkhtmltopdf":"C:/Program Files/wkhtmltopdf/bin/wkhtmltopdf.exe",
+    "salesforce_subject_areas": [
+        {
+            "description": "Account and Opportunity data for sales analysis",
+            "domain": "Account and Opportunity data for sales analysis",
+            "file_wise_data_information": {
+                "acccount": {
+                    "data_information": "Account data for sales analysis",
+                    "business_rules_and_conditions": ""
+                },
+                "opportunity": {
+                    "data_information": "Opportunity data for sales analysis",
+                    "business_rules_and_conditions": ""
+                }
+            },
+            "comingSoon": false,
+            "id": "sales",
+            "sObjects": [
+                "Account",
+                "Opportunity"
+            ],
+            "icon": "BarChart3",
+            "color": "bg-blue-500",
+            "useCases": [
+                "Sales Performance Analysis",
+                "Pipeline Management",
+                "Lead Conversion Tracking",
+                "Customer Segmentation"
+            ],
+            "name": "Sales"
+        },
+        {
+            "description": "Customer support and case management data",
+            "file_wise_data_information": {
+                "acccount": {
+                    "data_information": "Account data for customer support analysis",
+                    "business_rules_and_conditions": "Business rules and conditions for Account data"
+                },
+                "case": {
+                    "data_information": "Case data for customer support analysis",
+                    "business_rules_and_conditions": "Business rules and conditions for Case data"
+                },
+                "contact": {
+                    "data_information": "Contact data for customer support analysis",
+                    "business_rules_and_conditions": "Business rules and conditions for Contact data"
+                }
+            },
+            "domain": "Customer support and case management data",
+            "comingSoon": true,
+            "id": "service",
+            "sObjects": [
+                "Account",
+                "Case",
+                "Contact"
+            ],
+            "icon": "HeadphonesIcon",
+            "color": "bg-green-500",
+            "useCases": [
+                "Case Resolution Analysis",
+                "Customer Support SLA Tracking",
+                "Knowledge Base Insights"
+            ],
+            "name": "Service"
+        }
+    ],
+    "acumatica_scope": "api offline_access",
+    "acumatica_subject_areas": [
+        {
+            "description": "Stock Items, Warehouse, and Inventory data for inventory management",
+            "domain": "Stock Items, Warehouse, and Inventory data for inventory management",
+            "file_wise_data_information": {
+                "stock_items": {
+                    "data_information": "Stock Item data for inventory management",
+                    "business_rules_and_conditions": ""
+                },
+                "warehouse": {
+                    "data_information": "Warehouse Details data for inventory management",
+                    "business_rules_and_conditions": ""
+                }
+            },
+            "entities": [
+                "StockItem",
+                "Warehouse"
+            ],
+            "comingSoon": false,
+            "id": "Inventory",
+            "icon": "Package",
+            "color": "bg-green-500",
+            "useCases": [
+                "Inventory Level Monitoring",
+                "Warehouse Optimization",
+                "Stock Movement Analysis",
+                "Replenishment Planning"
+            ],
+            "name": "Inventory"
+        },
+        {
+            "description": "Production and manufacturing order data for shop floor and costing analysis",
+            "domain": "Manufacturing Management",
+            "file_wise_data_information": {
+              "production_orders": {
+                "data_information": "Production and work order data",
+                "business_rules_and_conditions": ""
+              },
+              "bom": {
+                "data_information": "Bill of Materials and material requirements",
+                "business_rules_and_conditions": ""
+              },
+              "work_centers": {
+                "data_information": "Work center and labor tracking data",
+                "business_rules_and_conditions": ""
+              }
+            },
+            "entities": ["ProductionOrder", "BillOfMaterial", "WorkCenter"],
+            "comingSoon": true,
+            "id": "Manufacturing",
+            "icon": "Factory",
+            "color": "bg-blue-500",
+            "useCases": [
+              "Production Cost Analysis",
+              "Material Consumption Tracking",
+              "WIP Monitoring",
+              "Resource Efficiency Analysis"
+            ],
+            "name": "Manufacturing"
+          },
+        {
+            "description": "Sales Orders, Sales Invoices, and Sales Shipments for sales analysis",
+            "domain": "The Acumatica Sales module supports the complete order-to-cash process by seamlessly linking Sales Orders, Shipments, and Invoices. Sales Orders capture customer demand with pricing, inventory, and credit validations. Shipments manage warehouse fulfillment and inventory updates. Invoices finalize billing and post transactions to Accounts Receivable for payment tracking.",
+            "file_wise_data_information": {
+                "sales_order": {
+                    "data_information": "The Sales Order entity contains all the details related to the generated order, including all line items along with their respective quantities. It uses the Acumatica default endpoint to fetch the Sales Order entity.",
+                    "business_rules_and_conditions": ""
+                },
+                "shipment": {
+                    "data_information": "The Shipment entity, retrieved using the Acumatica default endpoint, provides complete shipment information, including all associated shipment line items and their quantities.",
+                    "business_rules_and_conditions": ""
+                },
+                "sales_invoice": {
+                    "data_information": "The Sales Invoice entity, retrieved using the Acumatica default endpoint, provides complete invoice information, including all associated invoice line items and their quantities.",
+                    "business_rules_and_conditions": ""
+                }
+            },
+            "entities": [
+                "SalesOrder",
+                "SalesInvoice",
+                "Shipment"
+            ],
+            "comingSoon": false,
+            "id": "Sales",
+            "icon": "ShoppingCart",
+            "color": "bg-red-500",
+            "useCases": [
+                "Sales Pipeline Analysis",
+                "Order Fulfillment Tracking",
+                "Customer Purchase Patterns",
+                "Revenue Forecasting"
+            ],
+            "name": "Sales"
+        },
+        {
+            "description": "Financial transactions, GL, AR, AP, and cash flow management",
+            "domain": "Accounting and Financial Management",
+            "file_wise_data_information": {
+              "gl_account": {
+                "data_information": "Chart of accounts and general ledger data",
+                "business_rules_and_conditions": ""
+              },
+              "journal_transactions": {
+                "data_information": "Detailed journal entries and batches",
+                "business_rules_and_conditions": ""
+              },
+              "ap_ar": {
+                "data_information": "Accounts Payable and Receivable data",
+                "business_rules_and_conditions": ""
+              }
+            },
+            "entities": ["GLAccount", "GLBatch", "ARInvoice", "APBill", "CashAccount"],
+            "comingSoon": true,
+            "id": "Finance",
+            "icon": "Banknote",
+            "color": "bg-green-500",
+            "useCases": [
+              "Profit and Loss Analysis",
+              "Cash Flow Monitoring",
+              "Expense Management",
+              "Account Reconciliation"
+            ],
+            "name": "Finance"
+          },
+          {
+            "description": "Customer, lead, and opportunity management data for CRM insights",
+            "domain": "Customer Relationship Management",
+            "file_wise_data_information": {
+              "leads": {
+                "data_information": "Leads and prospects data for CRM",
+                "business_rules_and_conditions": ""
+              },
+              "opportunities": {
+                "data_information": "Sales opportunities and pipeline details",
+                "business_rules_and_conditions": ""
+              },
+              "contacts": {
+                "data_information": "Contact and business account data",
+                "business_rules_and_conditions": ""
+              }
+            },
+            "entities": ["Lead", "Opportunity", "Contact", "BusinessAccount"],
+            "comingSoon": true,
+            "id": "CRM",
+            "icon": "Users",
+            "color": "bg-blue-500",
+            "useCases": [
+              "Lead Conversion Analysis",
+              "Opportunity Pipeline Tracking",
+              "Campaign ROI Insights",
+              "Customer Engagement Analysis"
+            ],
+            "name": "CRM"
+          }
+        
+    ],
+    "salesforce_base_url_sandbox": "https://test.salesforce.com/services/oauth2/authorize",
+    "google_redirect_url": "http://localhost:3000",
+    "acumatica_cloud_function_url": "http://127.0.0.1:5002/insightbot-467305/us-central1/zingworks_acumatica_connector",
+    "storage_bucket": "insightbot-dev-474509.firebasestorage.app",
+    "acumatica_redirect_url": "http://localhost:3000/acumatica/oauth/callback",
+    "google_token_url": "https://oauth2.googleapis.com/token",
+    "salesforce_token_url_sandbox": "https://test.salesforce.com/services/oauth2/token",
+    "salesforce_redirect_url": "http://localhost:3000/salesforce/oauth/callback",
+    "salesforce_oauth_scope": "api refresh_token openid",
+    "container_memory_limit": "2g",
+    "docker_image_name": "code-execution-env",
+    "cors_allowed_origins": [
+        "http://localhost:3000"
+    ],
+    "sample_data_rows":10,
+    "sample_preload_data_info":[
+        {
+            "domain": "Healthcare",
+            "datasets": [
+                {
+                    "name": "COVID-19 World Vaccination Progress Dataset",
+                    "filename": "Covid_Data.pkl",
+                    "description": "A comprehensive dataset tracking global COVID-19 cases, deaths, testing, and vaccination statistics over time, helping to understand the spread and response to the pandemic.",
+                    "suggested_questions": [
+                        "How did COVID-19 vaccination rates correlate with total cases and deaths across continents over time?",
+                        "Which countries achieved the highest testing-to-positive ratios, and how did that impact infection control?",
+                        "What trends can be observed between GDP per capita and total COVID-19 cases or deaths per million?",
+                        "How did government stringency measures (Stringency Index) affect the reproduction rate (R-value)?",
+                        "Can we predict future COVID-19 case surges based on changes in mobility or testing rates?"
+                    ],
+                    "suggested_questions_simple": [
+                        "Show the total number of COVID-19 cases and deaths for each country.",
+                        "What is the percentage of the population that is fully vaccinated in top 5 countries?",
+                        "Which countries have the highest and lowest vaccination rates?",
+                        "What is the total number of COVID-19 tests performed and the test positivity rate for top 5 countries?",
+                        "Compare vaccination rates between top 5 countries."
+                    ]
+                },
+                {
+                    "name": "Diabetes Research Dataset",
+                    "filename": "Diabetes_Data.pkl",
+                    "description": "A detailed dataset of 1,879 patients containing demographic, lifestyle, medical, and clinical information — including medical history, medications, symptoms, and health behaviors — designed to support diabetes research, predictive modeling, and statistical health analyses while maintaining patient confidentiality.",
+                    "suggested_questions": [
+                        "What demographic and lifestyle factors (age, BMI, physical activity, diet quality) are most associated with diabetes diagnosis?",
+                        "How does medication adherence relate to blood sugar control (Fasting Blood Sugar, HbA1c levels)?",
+                        "Are there identifiable clusters of patients with similar health profiles using unsupervised learning (e.g., k-means)?",
+                        "How does quality of life vary with diabetes severity and comorbid conditions such as hypertension?",
+                        "Can we build a predictive model to classify patients as diabetic or non-diabetic using clinical and behavioral variables?"
+                    ],
+                    "suggested_questions_simple": [
+                        "How many patients in the dataset are diagnosed with diabetes?",
+                        "What is the average age of patients with diabetes?",
+                        "What is the average BMI of diabetic patients compared to non-diabetic patients?",
+                        "How many diabetic patients also have hypertension or other comorbid conditions?",
+                        "What proportion of patients are taking diabetes medications?",
+                        "How do key health metrics (like fasting blood sugar or BMI) differ between diabetic and non-diabetic patients?"
+                    ]
+                }
+            ]
+        },
+        {
+            "domain": "Retail",
+            "datasets": [
+                {
+                    "name": "Walmart Sales Dataset",
+                    "filename": "Walmart_Data.pkl",
+                    "description": "A detailed dataset containing Walmart store-level sales information across multiple locations and time periods. It includes features like weekly sales, temperature, fuel price, consumer price index (CPI), unemployment rate, and holiday indicators — useful for generating insights on demand patterns, inventory management, and building sales forecasting models.",
+                    "suggested_questions": [
+                        "How do holidays and seasonal trends impact weekly sales across different Walmart stores?",
+                        "What is the relationship between fuel price, unemployment rate, and store sales performance?",
+                        "Which stores consistently outperform others, and what factors contribute to higher sales?",
+                        "Can we predict future sales for each store using time series forecasting models (e.g., ARIMA, Prophet)?",
+                        "How sensitive are Walmart sales to macroeconomic indicators like CPI and unemployment rate?"
+                    ],
+                    "suggested_questions_simple": [
+                        "What are the total weekly sales for each Walmart store?",
+                        "Which Walmart store has the highest total sales?",
+                        "How do average weekly sales differ between holiday and non-holiday weeks?",
+                        "What is the average weekly sales across all stores?",
+                        "Which weeks had the lowest sales for the top 5 stores?",
+                        "Compare total sales between top 5 stores."
+                    ]
+                },
+                {
+                    "name": "Online Retail Dataset",
+                    "filename": "Online_Retail.pkl",
+                    "description": "A transactional dataset capturing detailed sales records from a UK-based online retail business between December 2010 and December 2011. It includes product, customer, and pricing details for over half a million transactions, enabling analysis of purchasing behavior, sales performance, and inventory trends. This dataset is ideal for applications such as market segmentation, demand forecasting, and customer relationship analytics in the e-commerce sector.",
+                    "suggested_questions": [
+                        "Which products generate the highest total revenue and profit margins across all transactions?",
+                        "How do customer purchasing patterns vary by country or season?",
+                        "Can we segment customers using RFM (Recency, Frequency, Monetary) analysis to identify loyal and high-value buyers?",
+                        "What percentage of transactions involve cancellations or returns, and what patterns exist among them?",
+                        "How can we predict the likelihood of repeat purchases based on past transaction behavior and product types?"
+                    ],
+                    "suggested_questions_simple": [
+                        "Which products generate the highest total revenue?",
+                        "What is the total revenue by country?",
+                        "How many unique customers are present in the dataset?",
+                        "Which customers have the highest total spending?",
+                        "Show monthly total sales for the online retail store.",
+                        "Which months have the highest number of orders?",
+                        "What is the total quantity sold for each product?"
+                    ]
+                }
+            ]
+        },
+        {
+            "domain": "Transportation",
+            "datasets": [
+                {
+                    "name": "NCR Ride Booking Dataset",
+                    "filename": "Ncr_Ride_Bookings.pkl",
+                    "description": "A detailed dataset containing transactional and operational data for ride bookings within the NCR region. It includes booking identifiers, timestamps, pickup and drop locations, vehicle types, ride outcomes, cancellation reasons, customer and driver ratings, and payment methods. This dataset enables analysis of ride fulfillment patterns, cancellations, operational bottlenecks, and customer experience to improve ride service efficiency and performance.",
+                    "suggested_questions": [
+                        "What are the main causes of ride cancellations or incomplete rides, and how do they vary by location or time?",
+                        "Which vehicle types (e.g., eBike, Sedan) have the highest completion and satisfaction (rating) rates?",
+                        "How does ride demand fluctuate across different times of day or days of the week in the NCR region?",
+                        "What operational factors contribute most to \u201cNo Driver Found\u201d events?",
+                        "Can we build a predictive model to estimate ride completion probability or expected booking value based on trip attributes?"
+                    ],
+                    "suggested_questions_simple": [
+                        "How many rides were completed, cancelled, or had no driver found?",
+                        "What is the total number of ride bookings for each pickup location?",
+                        "How do ride bookings vary by hour of the day and day of the week?",
+                        "Which vehicle type has the highest number of completed rides?",
+                        "What is the average customer rating for each vehicle type?",
+                        "What are the most common cancellation reasons and how often does each reason occur?",
+                        "Which pickup and drop locations have the highest number of completed rides?"
+                    ]                    
+                }
+            ]
+        }
+    ]
+}

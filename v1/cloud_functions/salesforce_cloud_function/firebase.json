@@ -1,0 +1,30 @@
+{
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "emulators": {
+    "functions": {
+      "port": 5001,
+      "timeoutSeconds": 0,
+      "timeout": "0s"
+    },
+    "firestore": {
+      "port": 8085
+    }
+  },
+  "functions": [
+    {
+      "source": "functions",
+      "service_account": "firebase-adminsdk-fbsvc@insightbot-467305.iam.gserviceaccount.com",
+      "codebase": "default",
+      "ignore": [
+        "venv",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local"
+      ]
+    }
+  ]
+}

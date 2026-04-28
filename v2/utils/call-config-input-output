@@ -1,0 +1,855 @@
+CALL DA-1 — Query Analysis
+Agent: DataAnalysisAgent | Function: analyze_user_query()
+
+Configuration
+API:              client.responses.create()   [OpenAI Responses API]
+Model:            os.getenv("MODEL_NAME", "gpt-4.1-mini")
+                  → currently "gpt-4.1" (from .env)
+max_output_tokens: 1500
+temperature:      NOT SET  (Responses API default)
+format:           json_object  ← ENFORCED
+verbosity:        "medium"
+multimodal:       No
+retries:          No → fallback: _fallback_query_analysis() (hardcoded plan)
+
+Input - 
+prompt,
+User Message
+User query: Compare sales performance by region over the last 12 months
+
+output -
+ "thinking_logs": [],
+  "is_supportable": true,
+  "unsupported_reason": null,
+  "user_intent": "Compare total revenue and deal performance across geographic regions for the past 12 months",
+  "sub_queries": [],
+  "plan": [],
+  "expected_output": [Bar chart ,Line chart ,Summary table
+
+----------------------------------------------------------------------------------------
+
+CALL EDA-1 — EDA Task Planning
+Agent: EDAAgent.plan_initial_tasks()
+
+CONFIGURATION
+
+API Method        : client.responses.create()
+Model             : os.getenv("MODEL_NAME", "gpt-4.1-mini")  →  "gpt-4.1"
+max_output_tokens : 1000
+temperature       : NOT SET
+format            : text.format = {"type": "json_object"}  ← JSON enforced
+verbosity         : text.verbosity = "medium"
+multimodal        : No
+retries           : No → fallback: _fallback_plan() — 1 generic task
+called            : Once per cycle (up to 2 cycles in deep mode)
+post-processing   : _normalize_cycle_tasks() enforces exactly 5 tasks
+                    pads with filler tasks if LLM returns fewer
+
+input - {'thinking_logs': [...], 'is_supportable': True, 'user_intent': 'Compare total revenue
+and deal performance...', 'sub_queries': [...], 'plan': [...], 'expected_output': [...]
+
+
+OUTPUT-
+  "thinking_logs": [],
+  "tasks": [{"task_id": 1,
+      "description"},
+    {"task_id": 2,
+      "description"},
+    {"task_id": 3,
+      "description"},
+    {"task_id": 
+      "description},
+    {"task_id": ,
+      "description"}]}
+
+------------------------------------------------------------------------------------------
+CALL EDA-2 — Code Generation (×5 tasks × up to 2 cycles)
+Agent: CodeAgent.nl_to_code()
+
+CONFIGURATION
+
+API Method        : client.responses.create()
+Model             : os.getenv("MODEL_NAME", "gpt-4.1-mini")  →  "gpt-4.1"
+max_output_tokens : 8000   ← largest in entire system
+temperature       : NOT SET
+format            : text.format = {"type": "json_object"}  ← JSON enforced
+verbosity         : text.verbosity = "medium"
+multimodal        : No
+retries           : YES — up to 2 retries (deep/medium), 1 (shallow), 2 (slim)
+                    On retry: previous failed code + error appended to history
+system prompt     : SYSTEM_PROMPT_WITH_IMAGE_MASTER  (if pseudonymized session)
+                    SYSTEM_PROMPT_NO_IMAGE_MASTER    (otherwise)
+pre-execution     : generated code prepended with state variable injection:
+                    import json     
+
+INPUT - 
+Context (last 4 runs, with errors if any):
+[
+  {
+    "attempt": 1,
+    "error": null,
+    "code_snippet": "import json\nimport os\nwith open(os.path.join(state['input_dir'], 'domain_directory.json')) as f:\n    dd = json.load(f)\nprint(dd)...",
+    "output_snippet": "{'domain_name': 'Sales CRM', 'data_set_files': {'Opportunity.pkl': {'columns': ['Region','Revenue',..."
+  }
+]
+
+OUTPUT - json
+{
+  "thinking_logs": [],
+  "code": "import pandas as pd\nimport matplotlib.pyplot as plt\nimport os\nimport json\n\n# Use preloaded df from previous task (kernel persists)\nrevenue_by_region = df.groupby('Region')['Revenue'].sum().reset_index()\nrevenue_by_region = revenue_by_region.sort_values('Revenue', ascending=False)\n\n# Define paths\nimg_stem = 'revenue_by_region'\nimg_path = os.path.join(state['output_dir'], f'{img_stem}.png')\nsnap_path = os.path.join(state['output_dir'], 'image_utils', f'{img_stem}__dataset.csv')\nmaster_path = os.path.join(state['output_dir'], 'image_master.json')\n\n# Save snapshot CSV BEFORE generating image\nos.makedirs(os.path.join(state['output_dir'], 'image_utils'), exist_ok=True)\nrevenue_by_region.to_csv(snap_path, index=False)\n\n# Load existing image_master\ntry:\n    with open(master_path, 'r') as f:\n        img_master = json.load(f)\nexcept Exception:\n    img_master = {}\n\n# Generate chart\nfig, ax = plt.subplots(figsize=(10, 6))\nbars = ax.bar(revenue_by_region['Region'], revenue_by_region['Revenue'], color='#003DA5')\nax.set_title('Total Revenue by Region — Last 12 Months', fontsize=14, fontweight='bold')\nax.set_xlabel('Region', fontsize=12)\nax.set_ylabel('Revenue (INR)', fontsize=12)\nfor bar, val in zip(bars, revenue_by_region['Revenue']):\n    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 50000,\n            f'₹{val:,.0f}', ha='center', va='bottom', fontsize=9)\nplt.tight_layout()\nplt.savefig(img_path, dpi=150, bbox_inches='tight')\nplt.close()\n\n# Generate code snippet string for image_master\ncode_str = 'df.groupby(Region)[Revenue].sum() — bar chart'\n\n# Atomic update image_master\nimg_master[f'{img_stem}.png'] = {\n    'path': os.path.abspath(img_path),\n    'code': code_str,\n    'data_set_name': f'{img_stem}__dataset.csv',\n    'data_set_path': os.path.abspath(snap_path),\n    'pseudonymized_columns': [],\n    'selected_by_narrator': False\n}\ntmp_path = master_path + '.tmp'\nwith open(tmp_path, 'w') as f:\n    json.dump(img_master, f, indent=2)\nos.replace(tmp_path, master_path)\n\nprint(f'Chart saved: {img_path}')\nprint(revenue_by_region.to_string(index=False))\nNone"
+}
+-------------------------------------------------------------------------------------------------
+CALL EDA-3 — Completeness Check
+Agent: EDAAgent.analyze_completeness()
+
+CONFIGURATION
+API Method        : client.responses.create()
+Model             : os.getenv("MODEL_NAME", "gpt-4.1-mini")  →  "gpt-4.1"
+max_output_tokens : 500   ← smallest structured call
+temperature       : NOT SET
+format            : text.format = {"type": "json_object"}  ← JSON enforced
+verbosity         : text.verbosity = "medium"
+multimodal        : No
+retries           : No → fallback: {"sufficient": True} — stops loop
+skipped           : In slim mode (loop breaks after cycle 1 unconditionally)
+                    Also skipped if iteration < min_iterations                     
+
+INPUT - INPUT — User Message
+
+Original request: Perform {'user_intent': 'Compare total revenue across regions...'} 
+analysis: Compare sales performance by region over the last 12 months
+Completed EDA tasks:
+  Task: 1
+  Output: {json}}...
+  Task: 2
+  Output: 
+  Task: 3
+  Output:  
+  Task: 4
+  Output: 
+  Task: 5
+  Output:
+Current outputs: 2 images, 2 data files (max 10 each).
+Do NOT suggest additional_tasks if limits would be exceeded.
+Is this analysis sufficient for the original request? Return valid JSON only.  
+
+OUTPUT - {"sufficient": false,
+  "reasoning":",
+  "additional_tasks": [{task_id": 6,
+    "description":}]}                  
+-------------------------------------------------------------------
+CALL EDA-4 — Vision Analysis Per Image (concurrency = 3)
+Agent: EDAAgent._analyze_single_image()
+
+CONFIGURATION
+
+API Method        : client.responses.create()
+Model             : os.getenv("MODEL_NAME", "gpt-4.1-mini")  →  "gpt-4.1"
+max_output_tokens : 600
+temperature       : NOT SET
+format            : NOT ENFORCED  ← plain text response
+verbosity         : NOT SET
+multimodal        : YES — base64 PNG/JPG sent as input_image block
+retries           : No → fallback: error string appended for that image
+concurrency       : asyncio.Semaphore(3) — max 3 simultaneous calls
+skipped           : Entirely in slim mode    
+
+INPUT - 
+[Text part]:
+Analyze this data visualization image generated by the EDA process: revenue_by_region.png
+Please provide:
+1. Description of the chart/graph type and what it shows
+2. Key patterns, trends, or insights visible
+3. Statistical observations
+4. Any notable findings or anomalies
+5. How this visualization contributes to understanding the data
+Be concise but thorough in your analysis.
+[Image part]:
+  type       : input_image
+  image_url  : plain text - (analysis)
+
+-------------------------------------------------------------------------------------------
+
+CALL EDA-5 — EDA Synthesis
+Agent: EDAAgent.synthesize_results()
+
+CONFIGURATION
+API Method        : client.responses.create()
+Model             : os.getenv("MODEL_NAME", "gpt-4.1-mini")  →  "gpt-4.1"
+max_output_tokens : 1000
+temperature       : NOT SET
+format            : NOT ENFORCED  ← plain text
+verbosity         : NOT SET
+multimodal        : No
+retries           : No → fallback: error string stored as eda_summary
+output stored     : state["eda_summary"] — used by HypothesisAgent and NarratorAgent
+
+INPUT -
+User Message
+EDA Analysis Results:
+  Tasks and Findings
+Generated Visualizations: 3 chart(s)
+Chart files: .png files
+Vision Analysis Report:
+  **revenue_by_region.png:**
+  Vertical bar chart. North dominates at ₹2.3M. 19x spread between top and bottom...
+  **monthly_revenue_trend.png:**
+  Multi-line chart. Clear Q3 peak across all regions. December shows steepest decline...
+  **deal_analysis_by_region.png:**
+  Grouped bar chart. North leads in both volume (234) and deal size (₹9,829 avg)...
+Create a comprehensive EDA summary combining numerical analysis and visual insights.
+Mode instruction: Provide deep analytical detail, clear insight explanations,
+and actionable recommendations.
+
+OUTPUT (Plain text — stored as state["eda_summary"])
+-------------------------------------------------------------------------------
+CALL HYP-1 — Generate Hypotheses
+Agent: HypothesisAgent.generate_hypotheses()
+
+CONFIGURATION
+
+API Method        : client.responses.create()
+Model             : os.getenv("MODEL_NAME", "gpt-4.1-mini")  →  "gpt-4.1"
+max_output_tokens : 800
+temperature       : NOT SET
+format            : text.format = {"type": "json_object"}  ← JSON enforced
+verbosity         : text.verbosity = "medium"
+multimodal        : No
+retries           : No → fallback: _generate_default_hypotheses() — 1 generic hypothesis
+skipped           : Entirely in slim mode
+count control     : hypothesis_task_count(mode, depth):
+                    slim=0, shallow=2, medium=3, deep=3
+
+INPUT - EDA Summary:
+## EDA Summary: 
+### Key Findings
+Query Analysis Context:
+{'user_intent': 'Compare total revenue across regions for past 12 months',
+ 'sub_queries': [...], 'plan': [...], 'expected_output': [...]}
+(only for reference, do not give too much attention to it)
+
+OUTPUT -
+thinking logs
+hypothesis[ 
+"id": n,
+"hypothesis":]
+---------------------------------------------------------------------------
+CALL HYP-2 — Command Generation (×3 hypotheses)
+Agent: HypothesisAgent.generate_hypothesis_command()
+
+CONFIGURATION
+API Method        : client.responses.create()
+Model             : os.getenv("MODEL_NAME", "gpt-4.1-mini")  →  "gpt-4.1"
+max_output_tokens : 400   ← very small
+temperature       : NOT SET
+format            : text.format = {"type": "json_object"}  ← JSON enforced
+verbosity         : text.verbosity = "medium"
+multimodal        : No
+retries           : No → fallback: "Test hypothesis: <statement> using statistical analysis"
+output used as    : nl_command input for HYP-3 (CodeAgent)
+
+INPUT - 
+response of prev call
+available files
+Refer to the domain directory: {'domain_name': 'Sales CRM', 'data_set_files':
+  {'Opportunity.pkl': {'columns': ['Region','Revenue','DealSize',...]}}}
+  and understand the data structure.
+Generate only a clear, simple command - no complex instructions.
+
+OUTPUT - thinking logs and command
+---------------------------------------------------------------------------------------------------
+CALL HYP-3 — Hypothesis Code Generation (×3)
+Identical to EDA-2 — same CodeAgent.nl_to_code() function, same system prompt, same configuration.
+
+Key difference in User Message — nl_command is the command from HYP-2:
+
+
+User request:
+  Load Opportunity.pkl from input_data. Group by Region and calculate average DealSize
+  for each region. Compare top 2 regions (North and Central) vs bottom 2 regions
+  (West and South-East) using an independent t-test on their DealSize values.
+  Create a bar chart showing average DealSize per region sorted descending, with
+  the title 'Average Deal Size by Region'. Save the chart as
+  hypothesis_1_avg_deal_size_by_region.png and save the t-test results summary
+  as hypothesis_1_ttest_results.csv in output_data.
+  -----------------------------------------------------------------------------------------------
+
+
+CALL HYP-4 — Hypothesis Image Vision (per image per hypothesis)
+Agent: HypothesisAgent._analyze_images_for_hypothesis()
+
+CONFIGURATION
+API Method        : client.responses.create()
+Model             : os.getenv("MODEL_NAME", "gpt-4.1-mini")  →  "gpt-4.1"
+max_output_tokens : 600
+temperature       : NOT SET
+format            : NOT ENFORCED  ← plain text
+verbosity         : NOT SET
+multimodal        : YES — base64 image
+retries           : No → appends error string
+concurrency       : Sequential (no semaphore — 1-2 images per hypothesis)
+note              : MIME type hardcoded as "image/png" regardless of actual extension
+
+INPUT — User Message (Multimodal)
+[Text part]:
+Analyze this visualization for Hypothesis 1:.
+[Image part]:
+  type      : input_image
+  image_url : data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...
+              (hardcoded as image/png regardless of actual extension)
+
+OUTPUT - plain text
+
+----------------------------------------------------------------------------------------------------
+
+CALL HYP-5 — Final Judgment (×3 hypotheses)
+Agent: HypothesisAgent._make_final_judgment()
+
+CONFIGURATION
+API Method        : client.responses.create()
+Model             : os.getenv("MODEL_NAME", "gpt-4.1-mini")  →  "gpt-4.1"
+max_output_tokens : 1000
+temperature       : NOT SET
+format            : NOT ENFORCED  ← plain text
+verbosity         : NOT SET
+multimodal        : No
+retries           : No → saves error string as judgment
+saved to disk     : hypothesis_1_judge_summary.txt
+
+INPUT — User Message
+HYPOTHESIS JUDGMENT FOR ID: 1
+Hypothesis Statement:
+EVIDENCE ANALYSIS:
+Text Files Analysis:
+  File: hypothesis_1_results.txt
+Data Files Analysis:
+  Data File: hypothesis_1_ttest_results.csv
+  Shape: (4, 4)
+  Columns:
+  Statistics:
+Visual Analysis Summary:
+hypothesis_1_avg_deal_size_by_region.png - description
+
+OUTPUT (Plain text — saved as hypothesis_1_judge_summary.txt)
+
+HYPOTHESIS 1 JUDGMENT SUMMARY
+============================================================
+HYPOTHESIS STATEMENT:
+VERDICT: SUPPORTED
+Strength of Evidence: STRONG
+Key Supporting Evidence:
+Business Implications:
+Analysis Quality:
+-------------------------------------------------------------------------------------------
+CALL HYP-6 — Incremental Synthesis (×3 sequential)
+Agent: HypothesisAgent.synthesize_hypothesis_results()
+
+CONFIGURATION:
+API Method        : client.responses.create()
+Model             : "gpt-4.1"  ← HARDCODED always — never reads MODEL_NAME env var
+max_output_tokens : 600
+temperature       : NOT SET
+format            : text.format = {"type": "json_object"}  ← JSON enforced
+verbosity         : text.verbosity = "medium"
+multimodal        : No
+retries           : No → skips that judge file on error
+sequential        : YES — each call feeds previous output as input (incremental synthesis)
+stored in state   : state["hypothesis_findings"] and state["hypothesis_summary"]
+
+INPUT — User Message (changes each iteration)
+ 
+ First call (hypothesis_1_judge_summary.txt):
+PREVIOUS_FINDINGS (JSONL):
+None
+PREVIOUS_SYNTHESIS:
+None
+CURRENT_SUMMARY (hypothesis_1_judge_summary.txt):
+HYPOTHESIS 1 JUDGMENT SUMMARY=>
+HYPOTHESIS STATEMENT:
+Top-performing regions have significantly higher average deal sizes...
+VERDICT: SUPPORTED
+Strength of Evidence: STRONG
+t-statistic: 4.82, p-value: 0.0009...
+[full file content]
+
+
+Second call (hypothesis_2_judge_summary.txt):
+PREVIOUS_FINDINGS (JSONL):
+{"hypothesis_id": 1, "hypothesis": "Top regions have higher average deal sizes",
+ "result_status": "SUPPORTED", "result": "t-test confirms 3.7x deal size gap at p=0.0009",
+ "rationale": "Statistical testing conclusively shows North/Central close deals at ₹9,829
+ avg vs West/South-East at ₹2,885 avg — driving the revenue performance gap."}
+PREVIOUS_SYNTHESIS:
+Regional performance analysis confirms that North and Central regions hold a significant
+deal size advantage (3.7x vs bottom regions), validated at 99.9% confidence. This points
+to capability and qualification gaps in West and South-East, not just lead volume issues.
+CURRENT_SUMMARY (hypothesis_2_judge_summary.txt):
+
+HYPOTHESIS 2 JUDGMENT SUMMARY
+VERDICT: SUPPORTED
+Q3 vs Q4 ANOVA: F=18.4, p=0.0003...
+[full file content]
+
+
+OUTPUT-
+{"finding": {
+    "hypothesis_id": 2,
+    "hypothesis":
+    "result_status":
+    "result":
+    "rationale:
+  },
+  "synthesis":}
+-----------------------------------------------------------------------------------------------
+CALL NAR-1 — Report Frame & File Selection
+Agent: NarratorAgent._draft_report_frame()
+
+CONFIGURATION
+API Method        : client.responses.create()
+Model             : "gpt-4.1"  ← HARDCODED always
+max_output_tokens : 2000
+temperature       : NOT SET
+format            : text.format = {"type": "json_object"}  ← JSON enforced
+verbosity         : text.verbosity = "medium"
+multimodal        : No
+retries           : No → fallback: {"frame_text": "", "selected_files": []}
+slim mode         : image files filtered from all_files before this call
+                    selected_files hard-capped at 5 in slim mode after response
+
+INPUT -
+{
+  "original_query": 
+  "report_verbosity": 
+  "hypothesis_summary": "Two of three hypotheses SUPPORTED. (1) Top regions have 3.7x larger avg deal sizes — validated at 99.9% confidence. (2) Q3 revenue is 42% higher than Q4 — confirmed seasonal pattern. Strategic implication: invest in upsell training for West/South-East AND pre-plan Q4 recovery incentives.",
+  "hypothesis_findings": [
+    {"hypothesis_id": 1,Top regions have higher average deal sizes",
+      "result_status": "SUPPORTED",
+      "result": ,
+      "rationale":},
+    {
+      "hypothesis_id": 2,....
+    }
+  ],
+  "eda_summary": "## EDA Summary: Sales Performance by Region\n\n### Key Findings\n1. Revenue Concentration: North region contributes ₹2.3M (38% of total ₹6.1M)...\n2. Dual Advantage — North Region: leads in BOTH deal volume (234) AND deal size (₹9,829)...\n3. Seasonality Pattern: Clear Q3 peak (Aug-Sep). December shows steepest decline...\n4. Data Quality: 1,240 records, no missing values. 3 duplicate OpportunityIDs...",
+  "all_files": [
+    "/data/user/session/output/job123/hypothesis_1_ttest_results.csv",
+    "/data/user/session/output/job123/hypothesis_2_quarterly_revenue.png",
+    "/data/user/session/output/job123/hypothesis_1_judge_summary.txt",
+    
+  ]
+}
+
+OUTPUT - {
+  "frame_text": "This analysis examines 12 months of sales performance across 6 geographic regions within the Sales CRM dataset. The findings reveal a deeply concentrated revenue structure, with the North region alone contributing 38% of total revenue — sustained by a 3.7x deal size advantage over low-performing regions, not just higher sales volume. Statistical hypothesis testing confirms that this performance gap is structural and significant (p<0.001), and that revenue follows a predictable seasonal cycle peaking in Q3 and declining sharply in Q4. Together, these insights point to two high-impact strategic levers: (1) targeted upsell capability development in West and South-East regions, and (2) proactive Q4 incentive programs as a standard annual practice rather than a reactive response.",
+  "selected_files": [
+    "/data/user/session/output/job123/revenue_by_region.png",
+    "/data/user/session/output/job123/monthly_revenue_trend.png",
+    "/data/user/session/output/job123/deal_analysis_by_region.png",
+    "/data/user/session/output/job123/regional_kpi_summary.csv",
+    "/data/user/session/output/job123/hypothesis_1_avg_deal_size_by_region.png",
+    "/data/user/session/output/job123/hypothesis_1_ttest_results.csv",
+    "/data/user/session/output/job123/hypothesis_2_quarterly_revenue.png",
+    "/data/user/session/output/job123/hypothesis_1_judge_summary.txt"
+  ]
+}
+--------------------------------------------------------------------------------------
+CALL NAR-2 — Vision File Analysis (×selected image files, concurrency = 4)
+Agent: NarratorAgent.analyze_image_with_vision() via _analyze_selected_files_parallel()
+
+CONFIGURATION
+API Method        : client.responses.create()
+Model             : os.getenv("MODEL_NAME", "gpt-4.1-mini")  →  "gpt-4.1"
+max_output_tokens : 800
+temperature       : NOT SET
+format            : NOT ENFORCED at API level
+                    JSON requested in prompt text
+                    extracted via: re.search(r'\{.*\}', content, re.DOTALL)
+                    fallback if regex fails: {"selection": "include", "executive_summary": content[:150]}
+verbosity         : NOT SET
+multimodal        : YES — base64 image, MIME type from actual file extension
+retries           : No → fallback: {"selection": "exclude", "reasoning": "Error..."}
+concurrency       : asyncio.Semaphore(4)
+non-image files   : NOT sent to LLM — handled in pure Python:
+                    CSV → pandas read, preview_rows (first 20 rows)
+                    TXT/MD → text snippet (first 500 chars)
+
+
+INPUT — User Message (Multimodal)
+[Text part]:
+Analyze this visualization for inclusion in executive report.
+Business Context: Executive report
+Image Path: /data/user/session/output/job123/revenue_by_region.png
+Please provide:
+1. Selection decision (include/exclude) with business justification
+2. Executive summary (1-2 sentences explaining the key insight)
+3. Business implications (how this insight impacts business decisions)
+4. Technical details (brief explanation of the data represented)
+5. Recommendations (additional visualizations that would strengthen the business case)
+Return as JSON:
+{
+    "selection": "include|exclude",
+    "reasoning": "business justification for inclusion/exclusion",
+    "executive_summary": "1-2 sentence key insight for executives",
+    "business_implications": "how this insight impacts business decisions",
+    "technical_details": "brief explanation of the data represented",
+    "recommendations": "additional visualizations needed"
+}
+[Image part]:
+  type      : input_image
+  image_url : data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...
+              (MIME type correctly derived from actual file extension)    
+
+
+
+OUTPUT - 
+{
+  "selection": "include",
+  "reasoning":,
+  "executive_summary":
+  "business_implications":
+  "technical_details": 
+  "recommendations":}
+------------------------------------------------------------------------------------------
+CALL NAR-3 — Generate Final HTML Report
+Agent: NarratorAgent._generate_final_html()
+
+CONFIGURATION
+API Method        : client.responses.create()
+Model             : "gpt-4.1"  ← HARDCODED always
+max_output_tokens : 6000   ← second largest in system
+temperature       : NOT SET
+format            : text.format = {"type": "json_object"}  ← JSON enforced
+verbosity         : text.verbosity = "medium"
+multimodal        : No
+retries           : No → fallback: generate_error_report() — basic error HTML
+post-processing   : strips ```html fences if present
+                    wraps in <!DOCTYPE html> if missing
+                    then DataAnalysisAgent runs convert_images_to_base64_for_report()
+                    which replaces <img src="file.png"> with <img src="data:image/png;base64,...">
+
+INPUT - 
+{
+  "original_query": 
+  "current_date":
+  "analysis_mode":
+  "report_verbosity": "full",
+  "frame_text":,
+  "file_analyses": [
+    {"file": "/data/user/session/output/job123/revenue_by_region.png",
+      "type": "image",
+      "analysis": }
+    },
+    {
+      "file": "/data/user/session/output/job123/regional_kpi_summary.csv",
+      "type": "csv",
+      "columns": 
+      "preview_rows":[],
+      "approx_total_rows": 6
+    },
+    {
+      "file": "/data/user/session/output/job123/hypothesis_1_judge_summary.txt",
+      "type": "text",
+      "snippet": "HYPOTHESIS 1 JUDGMENT SUMMARY\nVERDICT: SUPPORTED\nt-statistic: 4.82, p-value: 0.0009\nMean DealSize Top: ₹9,100 | Bottom: ₹2,900..."
+    }
+  ],
+  "hypothesis_summary": 
+  "hypothesis_findings": [
+    {"hypothesis_id": 1, "result_status": "SUPPORTED", "result": "3.7x deal size gap confirmed at p=0.0009", "rationale": "..."},
+    {"hypothesis_id": 2, "result_status": "SUPPORTED", "result": "Q3 42% higher than Q4 at p=0.0003", "rationale": "..."}
+  ],
+  "eda_summary": "## EDA Summary: Sales Performance by Region\n\n### Key Findings\n1. Revenue Concentration: North region contributes ₹2.3M (38% of total ₹6.1M)..."
+}                    
+
+
+OUTPUT - hrml report
+--------------------------------------------------------------------------------------------------
+CALL QNA-1 — SimpleQnA Query Planning
+Agent: SimpleQnaDataAnalysisAgent.analyze_user_query()
+
+CONFIGURATION
+API Method        : client.chat.completions.create()  ← OLD Chat Completions API
+Model             : "gpt-4.1"  ← HARDCODED always
+max_tokens        : 1000
+temperature       : 0.2   ← LOW, near-deterministic plan
+response_format   : {"type": "json_object"}  ← JSON enforced
+multimodal        : No
+retries           : No → returns {} if fails, pipeline continues with empty plan
+
+
+INPUT - 
+User query: What are the top 5 regions by total revenue?
+Preloaded datasets (dataset -> dataframe var):
+  {"Opportunity.pkl": "df_opportunity", "Account.pkl": "df_account"}
+Generate tasks that directly use the preloaded dataframe variables and avoid
+re-loading datasets from disk in each task.
+df variable naming must be df_dataset_name format.
+
+OUTPUT - {
+  "plan": [
+    {
+      "id": "1",
+      "sub_query": "Calculate total revenue per region and identify top 5",
+      "code_instructions": "Using df_opportunity, group by 'Region' column and sum the 'Revenue' column. Sort descending and take top 5 rows. Name result as result_df with columns ['Region', 'Total_Revenue']. Since result_df will have <= 20 rows (only 5), print result_df fully using print(result_df.to_string(index=False)). Make last line None.",
+      "expected_output": "DataFrame with 5 rows and columns: Region, Total_Revenue — printed to stdout"
+    }
+  ]
+}
+-----------------------------------------------------------------------------------
+CALL QNA-2 — SimpleQnA Code Generation (×N tasks, max_retries=3)
+Agent: SimpleQnaExecutor.CodeAgent.nl_to_code()
+
+CONFIGURATION
+API Method        : client.chat.completions.create()  ← SYNC, wrapped in run_in_executor
+Model             : "gpt-4.1"  ← HARDCODED always
+max_tokens        : 2000
+temperature       : 0.1   ← very low, nearly deterministic
+response_format   : NOT SET  ← returns raw Python code, no JSON
+messages role     : "developer" for system (not "system")
+multimodal        : No
+retries           : YES — max_retries=3  ← hardcoded, NOT from analysis_mode.py
+                    On retry: error appended to history
+execution         : Sync API call run in thread pool via asyncio.run_in_executor(None, lambda:...)
+code cleanup      : strips ```python ... ``` and ``` ... ``` fences if present
+
+INPUT - 
+Context (last 4 runs with errors if any):
+[]
+[If retry attempt 2:]
+This is retry attempt 2. Previous attempts failed. Analyze the errors in context
+and generate code to fix them.
+query: Calculate total revenue per region and identify top 5
+code instructions: 
+expected output: DataFrame with 5 rows and columns: Region, Total_Revenue
+preloaded datasets (dataset -> dataframe var):
+  {"Opportunity.pkl": "df_opportunity", "Account.pkl": "df_account"}
+IMPORTANT ENVIRONMENT DETAILS:
+  - Absolute input directory: /data/user_at_email_com/session_abc123/input_data
+  - Absolute output directory: /data/user_at_email_com/session_abc123/output_data/job_xyz
+  - Before reading any file, verify os.path.exists(...)
+  - Never use relative paths
+
+  OUTPUT- (Raw Python code — NOT JSON, fences stripped)
+result_df = df_opportunity.groupby('Region')['Revenue'].sum().reset_index()
+result_df.columns = ['Region', 'Total_Revenue']
+result_df = result_df.sort_values('Total_Revenue', ascending=False).head(5)
+print(result_df.to_string(index=False))
+None
+--------------------------------------------------------------------------------------------
+CALL QNA-3— Answer Synthesis (Large CSV path)
+Agent: SimpleQnaDataAnalysisAgent.judge_answer() Triggered when: output contains __SAVED_CSV__=/path/to/file.csv
+
+CONFIGURATION
+
+API Method        : client.chat.completions.create()
+Model             : "gpt-4.1"  ← HARDCODED always
+max_tokens        : 1200
+temperature       : 0.2
+response_format   : NOT SET  ← returns raw HTML fragment
+multimodal        : No
+retries           : No
+post-processing   : ${filename.csv} placeholder replaced with data:text/csv;base64,...
+                    if model omits placeholder, fallback download link appended
+                    _sanitize_html_fragment() called to strip any full-page tags
+                    _inject_missing_value_note() adds NaN note if missing values found
+
+
+
+
+INPUT - 
+{
+  "answer_rules": "1. Always answer in the context of the user's question.\n2. Use precise numbers from the data...\n[contents of answer_rules.md]",
+  "original_query": "Show me all opportunities with revenue greater than 1 million",
+  "result_type": "csv_large",
+  "file_name": "high_value_opportunities.csv",
+  "download_placeholder": "${high_value_opportunities.csv}",
+  "sample_table": {
+    "headers": ["OpportunityID", "Region", "Revenue", "DealSize", "Stage"],
+    "rows": [
+      ["OP-1042", "North", "1500000", "Enterprise", "Closed Won"],
+      ["OP-2891", "Central", "1200000", "Enterprise", "Closed Won"],
+      ["OP-0337", "North", "1100000", "Mid-Market", "Negotiation"],
+      ["OP-4521", "East", "1050000", "Mid-Market", "Closed Won"]
+    ]
+  }
+}
+OUTPUT - raw html fragment
+
+
+
+1. DataAnalysisAgent (Orchestrator — Deep Dive)
+INPUT (what you give it)
+user_query        : "Compare sales performance by region over the last 12 months"
+input_dir         : /data/user/session_abc/input_data/
+output_dir        : /data/user/session_abc/output_data/job_xyz/
+analysis_mode     : "deep_dive"  (or "slim")
+question_depth    : "deep"       (or "shallow", "medium")
+socketio          : live Socket.IO connection for progress streaming
+job_id            : "job_xyz"
+cancellation_flag : shared flag to stop mid-run
+OUTPUT (what you get back)
+html_report_path  : /data/user/session_abc/output_data/job_xyz/final_report.html
+                    — self-contained HTML (all images base64-embedded)
+cost_data         : {"total_tokens": 84200, "total_cost_usd": 0.84}
+side-effect       : progress events emitted live to frontend via Socket.IO
+                    throughout entire run
+2. EDAAgent (Exploratory Data Analysis)
+INPUT (what DataAnalysisAgent gives it)
+state = {
+  "user_query"      : "Compare sales performance by region over the last 12 months",
+  "query_analysis"  : {
+                        "user_intent": "...",
+                        "sub_queries": [...],
+                        "plan": [...],
+                        "expected_output": [...]
+                      },
+  "input_dir"       : /data/user/session_abc/input_data/,
+  "output_dir"      : /data/user/session_abc/output_data/job_xyz/,
+  "analysis_mode"   : "deep_dive",
+  "question_depth"  : "deep",
+  "pseudonymized_columns_map" : {"Opportunity.pkl": ["AccountName"]}
+}
+OUTPUT (what it gives back to DataAnalysisAgent)
+state["eda_summary"]   : Plain text narrative
+                         "## EDA Summary: Sales Performance by Region
+                          ### Key Findings
+                          1. Revenue Concentration: North region contributes ₹2.3M (38%)...
+                          2. Dual Advantage — North leads in BOTH deal volume and deal size...
+                          3. Seasonality: Q3 peak (Aug–Sep). December sharpest decline...
+                          4. Data Quality: 1,240 records, 3 duplicate OpportunityIDs..."
+Files written to output_dir:
+  revenue_by_region.png
+  monthly_revenue_trend.png
+  deal_analysis_by_region.png
+  regional_kpi_summary.csv
+  deal_breakdown.csv
+  image_master.json           ← registry of all charts + their dataset snapshots
+3. HypothesisAgent (Statistical Testing)
+INPUT (what DataAnalysisAgent gives it)
+state = {
+  "user_query"         : "Compare sales performance by region...",
+  "query_analysis"     : { ...same as EDA input... },
+  "eda_summary"        : "## EDA Summary: Sales Performance by Region
+                          ### Key Findings
+                          1. Revenue Concentration: North region contributes ₹2.3M...
+                          ..."         ← EDA's output, now used as input
+  "input_dir"          : /data/user/session_abc/input_data/,
+  "output_dir"         : /data/user/session_abc/output_data/job_xyz/,
+  "analysis_mode"      : "deep_dive",
+  "question_depth"     : "deep"
+}
+OUTPUT (what it gives back to DataAnalysisAgent)
+state["hypothesis_findings"]  : List of dicts, one per tested hypothesis
+  [
+    {
+      "hypothesis_id"  : 1,
+      "hypothesis"     : "Top regions have higher average deal sizes",
+      "result_status"  : "SUPPORTED",
+      "result"         : "t-test confirms 3.7x deal size gap at p=0.0009",
+      "rationale"      : "North/Central avg ₹9,829 vs West/South-East ₹2,885"
+    },
+    {
+      "hypothesis_id"  : 2,
+      "hypothesis"     : "Q3 revenue is significantly higher than Q4",
+      "result_status"  : "SUPPORTED",
+      "result"         : "ANOVA confirms Q3 42% higher at p=0.0003",
+      "rationale"      : "Confirmed at 99.97% confidence — predictable seasonal pattern"
+    }
+  ]
+state["hypothesis_summary"]   : Plain text paragraph synthesizing all findings
+  "Two of three hypotheses SUPPORTED. (1) Top regions have 3.7x larger avg
+   deal sizes — validated at 99.9% confidence. (2) Q3 revenue is 42% higher
+   than Q4 — confirmed seasonal pattern. Strategic implication: invest in
+   upsell training for West/South-East AND pre-plan Q4 recovery incentives."
+Files written to output_dir:
+  hypothesis_1_avg_deal_size_by_region.png
+  hypothesis_1_ttest_results.csv
+  hypothesis_1_judge_summary.txt
+  hypothesis_2_quarterly_revenue.png
+  hypothesis_2_anova_results.csv
+  hypothesis_2_judge_summary.txt
+4. NarratorAgent (Final Report Generation)
+INPUT (what DataAnalysisAgent gives it)
+state = {
+  "user_query"           : "Compare sales performance by region...",
+  "eda_summary"          : "## EDA Summary..."          ← from EDAAgent
+  "hypothesis_summary"   : "Two of three hypotheses..." ← from HypothesisAgent
+  "hypothesis_findings"  : [ {...}, {...} ]              ← from HypothesisAgent
+  "query_analysis"       : { ...plan, sub_queries... }
+  "output_dir"           : /data/user/session_abc/output_data/job_xyz/
+  "analysis_mode"        : "deep_dive"
+  "question_depth"       : "deep"
+  "report_verbosity"     : "full"   (or "concise" in slim mode)
+}
++ all files already sitting in output_dir from EDA and Hypothesis phases
+OUTPUT (what it gives back to DataAnalysisAgent)
+File written to disk:
+  /data/user/session_abc/output_data/job_xyz/final_report.html
+  — Complete, self-contained HTML document
+  — All chart images embedded as base64 (no external file dependencies)
+  — McKinsey-style structure: Executive Summary → Findings → Implications → Recommendations
+  — CSS fully embedded in <style> tag (no external stylesheets)
+  — Scoped class selectors (no global CSS bleed)
+  — Tables built from actual CSV preview data (no hallucinated values)
+  — Ready to open in browser or convert to PDF
+5. SimpleQnaDataAnalysisAgent (Quick Q&A — separate pipeline)
+INPUT (what ExecutionApi gives it directly)
+user_query        : "What are the top 5 regions by total revenue?"
+input_dir         : /data/user/session_abc/input_data/
+output_dir        : /data/user/session_abc/output_data/job_xyz/
+domain_directory  : { "domain_name": "Sales CRM", "data_set_files": {...} }
+preloaded_datasets: {"Opportunity.pkl": "df_opportunity", "Account.pkl": "df_account"}
+                    (DataFrames already loaded into the Jupyter kernel before this call)
+OUTPUT (what ExecutionApi gets back)
+html_fragment     : Raw HTML string (NOT a full page — no <html>/<head>/<body>)
+                    — Scoped CSS in <style> tag (all classes prefixed qna-response-)
+                    — A title line answering the question
+                    — A 1-2 sentence summary paragraph
+                    — A formatted HTML table with actual data values
+                    — If result > 20 rows: table shows 10-row sample + download
+                      button with CSV embedded as base64 data URI
+Example output:
+  <style>.qna-response-container{...}</style>
+  <div class="qna-response-container">
+    <div class="qna-response-title">Top 5 Regions by Total Revenue</div>
+    <p class="qna-response-summary">
+      North region leads with ₹23,00,000, followed by Central (₹18,50,000).
+      Top 2 regions account for ~67% of combined top-5 revenue.
+    </p>
+    <table class="qna-response-table">
+      <thead><tr><th>Region</th><th>Total Revenue</th></tr></thead>
+      <tbody>
+        <tr><td>North</td><td>₹23,00,000</td></tr>
+        <tr><td>Central</td><td>₹18,50,000</td></tr>
+        ...
+      </tbody>
+    </table>
+  </div>
+Data Flow Summary
+
+User Request
+    │
+    ▼
+DataAnalysisAgent ──────────────────────────────────────────┐
+    │                                                        │
+    │ gives: query + paths + mode                           │
+    ▼                                                        │
+EDAAgent                                                     │ orchestrates
+    │ gives back: eda_summary + chart/csv files             │ all agents,
+    │                                                        │ returns final
+    │ gives: query + eda_summary + paths                    │ HTML report
+    ▼                                                        │
+HypothesisAgent                                              │
+    │ gives back: hypothesis_findings + hypothesis_summary  │
+    │             + test chart/csv/txt files                 │
+    │                                                        │
+    │ gives: query + eda_summary + hypothesis_summary       │
+    │         + hypothesis_findings + ALL files in output_dir│
+    ▼                                                        │
+NarratorAgent                                                │
+    │ gives back: final_report.html (self-contained)        │
+    └───────────────────────────────────────────────────────┘
+                                │
+                                ▼
+                    final_report.html returned to user
+SimpleQnA (completely separate, faster path):
+User Request → SimpleQnaDataAnalysisAgent → HTML fragment answer

@@ -1,0 +1,4 @@
+Hypothesis 1 Judgment Summary
+==================================================
+Hypothesis: There are statistically significant differences in one or more key numerical variables across distinct groups within the dataset.
+Status: INCONCLUSIVE - No analysis files generated

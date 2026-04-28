@@ -1,0 +1,801 @@
+{
+  "samarth.mali@zingworks.co": {
+    "4UeaJDGhn42ap38CwPyF": {
+      "session_obj": {
+        "name": "session_4UeaJDGhn42ap38CwPyF",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T15:30:35.718931+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "QGbRZ8eCKJ0ljeIEDYWq": {
+      "session_obj": {
+        "name": "session_QGbRZ8eCKJ0ljeIEDYWq",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T15:37:21.144799+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "1YYJpo5lYag4aFmwiGV4": {
+      "session_obj": {
+        "name": "session_1YYJpo5lYag4aFmwiGV4",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T15:38:11.386609+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "eXIAkH6fgNacu58bYl7Y": {
+      "session_obj": {
+        "name": "session_eXIAkH6fgNacu58bYl7Y",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T15:44:11.320987+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "mrAcaJwPOHZNc6H67t9Z": {
+      "session_obj": {
+        "name": "session_mrAcaJwPOHZNc6H67t9Z",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T16:03:22.232251+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "xzpvUdEhm9YhB0DR00j5": {
+      "session_obj": {
+        "name": "session_xzpvUdEhm9YhB0DR00j5",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T16:05:25.823911+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "QG7gQMVq3W3WlPhblGeu": {
+      "session_obj": {
+        "name": "session_QG7gQMVq3W3WlPhblGeu",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T16:15:18.751313+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "NDILamIPoROfHWNDXwRV": {
+      "session_obj": {
+        "name": "session_NDILamIPoROfHWNDXwRV",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T16:26:17.645421+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "0C5KUExoZxE9EAf8IV25": {
+      "session_obj": {
+        "name": "session_0C5KUExoZxE9EAf8IV25",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T16:31:21.484487+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "RpHB1YV5hxiRAlDLuSVp": {
+      "session_obj": {
+        "name": "session_RpHB1YV5hxiRAlDLuSVp",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T16:42:08.900488+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "d87WGzXhXknOSK6JoywY": {
+      "session_obj": {
+        "name": "session_d87WGzXhXknOSK6JoywY",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T16:53:39.564544+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "5eb8hcpcb1uZBmwmF1Wo": {
+      "session_obj": {
+        "name": "session_5eb8hcpcb1uZBmwmF1Wo",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:01:53.240571+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "8kjV5JOrSBxnzXqfzuln": {
+      "session_obj": {
+        "name": "session_8kjV5JOrSBxnzXqfzuln",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:02:40.426829+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "vL3i2O8O30eovYTQxTYp": {
+      "session_obj": {
+        "name": "session_vL3i2O8O30eovYTQxTYp",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:06:19.827950+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "RNYUdwOzSBJB0cMtJmfo": {
+      "session_obj": {
+        "name": "session_RNYUdwOzSBJB0cMtJmfo",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:09:50.133674+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "SNeGD2xctbNie8av3rHJ": {
+      "session_obj": {
+        "name": "session_SNeGD2xctbNie8av3rHJ",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:11:11.314786+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "UoEwadWd76bj7QVmDjWg": {
+      "session_obj": {
+        "name": "session_UoEwadWd76bj7QVmDjWg",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:11:36.807506+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "Z3JFmgVQGiyFlLyOtWLE": {
+      "session_obj": {
+        "name": "session_Z3JFmgVQGiyFlLyOtWLE",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:12:41.629510+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "PQMFr4zn2PGn1Jb1oSih": {
+      "session_obj": {
+        "name": "session_PQMFr4zn2PGn1Jb1oSih",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:15:12.459467+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "QDgrOqygpAKygjXHUUQe": {
+      "session_obj": {
+        "name": "session_QDgrOqygpAKygjXHUUQe",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:21:04.323058+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "lAIRBrlyvyASR9Fo50Su": {
+      "session_obj": {
+        "name": "session_lAIRBrlyvyASR9Fo50Su",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:22:50.597761+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "XViV38TzrDPaJFzgi3v4": {
+      "session_obj": {
+        "name": "session_XViV38TzrDPaJFzgi3v4",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:26:46.053987+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "G1XhEMpDsqGJB1IwWve4": {
+      "session_obj": {
+        "name": "session_G1XhEMpDsqGJB1IwWve4",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:27:00.754784+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "jWXNCTdoThE0jkWHOTqN": {
+      "session_obj": {
+        "name": "session_jWXNCTdoThE0jkWHOTqN",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:27:28.964218+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "XlJPR2e62XQq6QpOAbbt": {
+      "session_obj": {
+        "name": "session_XlJPR2e62XQq6QpOAbbt",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:30:36.550991+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "cxTFsQESQPWioaFDuY8M": {
+      "session_obj": {
+        "name": "session_cxTFsQESQPWioaFDuY8M",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:32:07.627051+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "PL0jId32fAQ7yBT4zdE1": {
+      "session_obj": {
+        "name": "session_PL0jId32fAQ7yBT4zdE1",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T12:47:47.429290",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "yaiujgp8aLU0e0zh8li4": {
+      "session_obj": {
+        "name": "session_yaiujgp8aLU0e0zh8li4",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T12:57:22.206910",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "HU9cAAu1hIAe4sQ1DEGA": {
+      "session_obj": {
+        "name": "session_HU9cAAu1hIAe4sQ1DEGA",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T13:07:08.535188",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "QhYTupBN3pj859kr0FFa": {
+      "session_obj": {
+        "name": "session_QhYTupBN3pj859kr0FFa",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T14:08:28.345355",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "QqgE67jz72e8DtzPYUu8": {
+      "session_obj": {
+        "name": "session_QqgE67jz72e8DtzPYUu8",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T14:13:20.446518",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "qeAChr0SMUMqdsJU64vG": {
+      "session_obj": {
+        "name": "session_qeAChr0SMUMqdsJU64vG",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T14:15:13.878611",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "mnXwhh1afQBGoqDjqi6X": {
+      "session_obj": {
+        "name": "session_mnXwhh1afQBGoqDjqi6X",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T14:15:23.844261",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "hbwRBgDiSZ3ch7XlP7Ho": {
+      "session_obj": {
+        "name": "session_hbwRBgDiSZ3ch7XlP7Ho",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T14:15:29.956081",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "KwUrxj49bGGZZgJ8ZeJe": {
+      "session_obj": {
+        "name": "session_KwUrxj49bGGZZgJ8ZeJe",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T14:25:57.195318",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "ipMiEF6wMg8XxwoYgluc": {
+      "session_obj": {
+        "name": "session_ipMiEF6wMg8XxwoYgluc",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T14:43:25.408800",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "xlnxduI7swyQ51lJDYLb": {
+      "session_obj": {
+        "name": "session_xlnxduI7swyQ51lJDYLb",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T14:56:53.987596",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "kOntSBUmi4DgQ0I08kA6": {
+      "session_obj": {
+        "name": "session_kOntSBUmi4DgQ0I08kA6",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T15:01:41.934125",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "6jwYDhJ7ZM8gWiYXzvur": {
+      "session_obj": {
+        "name": "session_6jwYDhJ7ZM8gWiYXzvur",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T15:04:33.449649",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "NClP0f9E0dFGnGRSt0a0": {
+      "session_obj": {
+        "name": "session_NClP0f9E0dFGnGRSt0a0",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T15:06:12.643382",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "GpL7tiwdJAsPkjvoeOqV": {
+      "session_obj": {
+        "name": "session_GpL7tiwdJAsPkjvoeOqV",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T15:08:44.022040",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "6z2uJju7ATpLrEwb707p": {
+      "session_obj": {
+        "name": "session_6z2uJju7ATpLrEwb707p",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T15:10:20.366738",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "bvK5bLyAt0HhGHNUipvi": {
+      "session_obj": {
+        "name": "session_bvK5bLyAt0HhGHNUipvi",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T15:10:24.590690",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "1VgLfybJQlsaqoCUNjnn": {
+      "session_obj": {
+        "name": "session_1VgLfybJQlsaqoCUNjnn",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T15:13:48.248012",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "dYf8b6vWymUZj2mYhSIE": {
+      "session_obj": {
+        "name": "session_dYf8b6vWymUZj2mYhSIE",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T15:15:29.898666",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "RJpk7wegkDZu1BHG7KLy": {
+      "session_obj": {
+        "name": "session_RJpk7wegkDZu1BHG7KLy",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T15:15:48.870182",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "axkTR5FeTUervup2MsHY": {
+      "session_obj": {
+        "name": "session_axkTR5FeTUervup2MsHY",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T15:16:30.662232",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    }
+  },
+  "xaeH65UV6pZwMp4Y6N5o": {
+    "2IaHaaXAxGqqY1aqEFF1": {
+      "session_obj": {
+        "name": "session_2IaHaaXAxGqqY1aqEFF1",
+        "config": {
+          "data_source": "Mssql",
+          "label": "Mssql",
+          "status": "active",
+          "created_on": "2025-12-09T17:37:57.853769+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "W5hm8XjZCTKI8hWFPg87": {
+      "session_obj": {
+        "name": "session_W5hm8XjZCTKI8hWFPg87",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T17:57:20.454843+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "5ms4vi9epQFiBAg1xVpi": {
+      "session_obj": {
+        "name": "session_5ms4vi9epQFiBAg1xVpi",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T18:50:13.951722+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "37SCB143mT35g3rlOP2u": {
+      "session_obj": {
+        "name": "session_37SCB143mT35g3rlOP2u",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T19:01:22.098423+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "quWJ9rTMWozB0biXFvrM": {
+      "session_obj": {
+        "name": "session_quWJ9rTMWozB0biXFvrM",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-09T19:08:02.730714+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    },
+    "SfnBCMvQcT8REZ1t13eE": {
+      "session_obj": {
+        "name": "session_SfnBCMvQcT8REZ1t13eE",
+        "config": {
+          "data_source": "string",
+          "label": "string",
+          "status": "active",
+          "created_on": "2025-12-10T11:23:52.488804+00:00",
+          "current_step": "1",
+          "next_step": "1",
+          "credential_id": null,
+          "job_ids": []
+        }
+      }
+    }
+  }
+}

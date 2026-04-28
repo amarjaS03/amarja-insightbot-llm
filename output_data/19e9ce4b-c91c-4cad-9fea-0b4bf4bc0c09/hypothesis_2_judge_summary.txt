@@ -1,0 +1,4 @@
+Hypothesis 2 Judgment Summary
+==================================================
+Hypothesis: There is a meaningful relationship in key business metrics relevant to the query (Hypothesis 2).
+Status: INCONCLUSIVE - No analysis files generated

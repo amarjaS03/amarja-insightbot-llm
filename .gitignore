@@ -1,0 +1,29 @@
+.venv
+venv
+__pycache__
+*.pyc
+*.pkl
+*.png
+*.svg
+*.csv
+node_modules
+dist
+.env
+*.env
+key-dev.json
+key-prod.json
+execution_layer/input_data
+execution_layer/output_data
+# Explicit backend ignores
+backend/.env
+backend/Dockerfile
+.vscode
+xyz.ipynb
+xyz.json
+seed_constants.py
+# Only ignore root-level sample_data directory, not controller directories
+/sample_data/
+ngrok-v3-stable-windows-amd64/
+
+# Local job/runtime data (do not push)
+local_data_dir/

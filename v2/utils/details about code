@@ -1,0 +1,1034 @@
+What is this file?
+run_execution_api.py is the startup script for the project's "Execution Layer" — think of it as the ignition key for a car. You run this file, and it boots up the entire AI analysis server. The actual server logic lives in execution_api.py; this file just handles how and when the server starts.
+
+Big Picture: What does the "Execution Layer" do?
+This project appears to be an AI-powered data analysis bot (called "Insight Bot"). When a user asks it to analyze data, the work gets sent to the Execution Layer — a Flask web server — which runs AI agents that actually process, analyze, and return results. This file is what starts that server.
+
+File Breakdown — Section by Section
+1. Imports (lines 1–13)
+import sys, os, argparse, subprocess, logging, time
+from logger import add_log
+These are standard Python tools:
+
+sys / os — interact with the operating system (paths, environment variables, etc.)
+argparse — lets you pass command-line flags like --port 5001
+subprocess — lets Python run other terminal commands (e.g., taskkill, netstat)
+logging — write structured log messages to the console
+time — for sleep/wait operations
+add_log — a custom logging function from the project's own logger.py. It timestamps and prints messages, and can also store them for a specific "job" (a single analysis run)
+2. _kill_port() — Free Up the Port (lines 16–35)
+def _kill_port(port: int):
+Problem it solves: If the server was already running and crashed or wasn't shut down cleanly, its port (e.g., 5001) is still "occupied" by the old process. Starting a new server on the same port would fail.
+
+What it does:
+
+On Windows: Runs netstat -ano (lists all network connections), finds the process ID (PID) using port 5001, and force-kills it with taskkill /F /PID <pid>
+On Linux/Mac: Runs fuser -k 5001/tcp (simpler one-liner to kill by port)
+Think of it like evicting a tenant before a new one moves in.
+
+3. _setup_logging() — Configure Console Output (lines 38–46)
+def _setup_logging():
+This sets up Python's built-in logging system so that all INFO level (and above) messages appear in the terminal in a readable format:
+
+2026-04-19 12:00:00 [INFO] werkzeug: * Running on http://0.0.0.0:5001
+Without this, you might miss important server messages.
+
+
+
+now explain execution_api.py 
+
+Now I have a complete picture of the entire file. Here is a thorough, beginner-friendly explanation.
+
+What is execution_api.py?
+This is the heart of the Insight Bot's backend. It is a Flask web server (a Python web server framework) that exposes several HTTP endpoints. When a user submits a data analysis question from the frontend, this server receives it, runs AI agents on the data, and returns an HTML report as the answer.
+
+Think of it as a factory floor manager: it receives orders (HTTP requests), dispatches workers (AI agents), and ships finished products (HTML reports).
+
+File Structure at a Glance
+execution_api.py
+│
+├── Imports & setup
+├── MetricsState        — tracks token usage (like counting AI "words used")
+├── ProgressEvent       — snapshot of how far along a job is
+├── CancellationManager — handles "stop this job" requests safely
+│
+└── ExecutionApi (main class)
+    ├── __init__()              — server startup / configuration
+    ├── _sanitize_email_for_storage() — safe folder names from emails
+    ├── _get_data_root()        — get the data directory path
+    ├── _resolve_paths()        — figure out where to read/write files
+    ├── _get_session_pseudonymized_flag() — check if user data is anonymized
+    ├── connect_to_api_layer()  — connect to the other server for live progress
+    ├── _create_milestone()     — mark a progress checkpoint
+    ├── _emit_progress()        — send a live progress update
+    │
+    ├── register_routes()       — define all HTTP endpoints:
+    │   ├── GET  /health                   — is the server alive?
+    │   ├── POST /cancel                   — stop a running job
+    │   ├── POST /cancel/clear             — clear a cancellation flag
+    │   ├── POST /analyze_job              — deep-dive analysis (main)
+    │   ├── POST /simpleqna/analyze_job    — quick Q&A analysis (job-based)
+    │   ├── POST /analyze                  — legacy deep-dive
+    │   └── POST /simpleqna/query          — quick Q&A (session-based)
+    │
+    ├── calculate_costs()       — calculate how much the AI query cost in $
+    ├── _generate_unsupported_query_report() — HTML for "can't answer" cases
+    ├── create_graph()          — build the AI agent pipeline (legacy)
+    ├── run_job_analysis()      — core logic for deep-dive analysis
+    ├── run_analysis()          — legacy version of the above
+    └── run()                   — start the Flask server
+Key Concepts You Need to Know First
+What is a "Job"?
+When a user submits a complex analysis request, the system creates a Job — a unit of work with a unique ID (job_id). Each job gets its own folder to store input data, intermediate outputs, and the final HTML report.
+
+What is a "Session"?
+A Session represents a user's working context — all the data files they uploaded and all the jobs they ran belong to one session. Multiple jobs can belong to one session.
+
+What are "Tokens"?
+AI language models (like GPT-4) charge by the number of "tokens" (roughly words/word-pieces) they process. This system tracks tokens consumed and calculates the monetary cost.
+
+What is Socket.IO?
+A technology for real-time, two-way communication. The execution layer uses it to push live progress updates (e.g., "10% done — running EDA...") to the frontend while the job runs.
+
+Section-by-Section Explanation
+1. Imports (lines 1–41)
+The file imports:
+
+Flask — the web server framework
+socketio — for real-time progress streaming
+asyncio — to run async (non-blocking) AI agent code
+firebase_admin / firestore — optional Google database for checking session metadata (like whether a session's data is anonymized)
+DataAnalysisAgent — the main AI agent that does the deep analysis
+SimpleQnaDataAnalysisAgent — a lighter AI agent for quick Q&A
+Both Firebase and SimpleQna imports are wrapped in try/except — if the library isn't installed, the server still starts (it just can't use those features).
+
+2. MetricsState (lines 43–47)
+class MetricsState(TypedDict):
+    total_tokens: int
+    prompt_tokens: int
+    completion_tokens: int
+    successful_requests: int
+A simple data structure (like a labeled box) that tracks:
+
+prompt_tokens — tokens sent to the AI (your question + context)
+completion_tokens — tokens received from the AI (the answer)
+total_tokens — sum of both
+successful_requests — how many AI calls succeeded
+This is used to calculate how much money each analysis costs.
+
+3. ProgressEvent (lines 49–68)
+A snapshot describing how far along a job is at a particular moment:
+
+What stage it's at (e.g., "EDA", "Report Generation")
+A human-readable message (e.g., "Running statistical analysis...")
+A percentage complete
+An optional emoji for display
+These events get sent to the frontend in real-time via Socket.IO so users see a progress bar.
+
+4. CancellationManager (lines 70–122)
+This class answers the question: "How do we safely stop a running job when the user clicks Cancel?"
+
+The problem: the AI agent runs in a Python thread/process. You can't just kill it instantly — that could corrupt files or leave locks behind. Instead:
+
+The /cancel endpoint calls cancel_session() or cancel_job(), which just sets a flag (adds the ID to a set)
+The AI agent periodically checks that flag at safe checkpoints
+When it sees the flag, it stops gracefully
+threading.Lock() ensures multiple threads don't corrupt the set simultaneously.
+
+5. ExecutionApi.__init__() — Server Startup (lines 125–202)
+This runs once when the server starts. It:
+
+a) Creates the Flask app
+
+self.app = Flask(__name__)
+CORS(self.app)
+CORS allows the frontend (running on a different domain/port) to talk to this server.
+
+b) Reads configuration from environment variables
+
+LOCAL_MODE — are we running on a developer's laptop (local) or Google Cloud Run (production)?
+GCS_BUCKET — the name of the Google Cloud Storage bucket (production only)
+DATA_DIR — where files are stored
+API_LAYER_URL — address of the other server that handles WebSocket connections to the frontend
+c) Sets up directories
+
+locks_dir — a folder for .lock files (prevent double-running the same job)
+output_dir — where analysis reports go
+d) Creates the simpleqna_agent A shared instance of the Quick Q&A agent, kept alive between requests so it doesn't need to re-initialize (warm cache = faster responses).
+
+e) Registers all the HTTP routes
+
+self.register_routes()
+6. _resolve_paths() — Where to Read/Write Files (lines 218–259)
+This figures out the correct folder paths for each job/session.
+
+In Local Mode (developer laptop):
+
+execution_layer/input_data/
+execution_layer/output_data/<job_id>/
+In Cloud Run (production):
+
+/data/<user_email>/<session_id>/input_data/
+/data/<user_email>/<session_id>/output_data/<job_id>/
+Each user gets their own folder, each session gets a subfolder, each job gets its own output folder. This prevents one user's data from bleeding into another's.
+
+7. connect_to_api_layer() — Connect for Live Progress (lines 285–336)
+The Execution Layer needs to send live progress updates to the frontend. It does this by connecting to the API Layer (a separate server that manages WebSocket connections with browsers).
+
+This function:
+
+Skips the connection in Local Mode (no need for real-time streaming in development)
+Tries to connect up to 5 times with exponential backoff (waits 1s, then 2s, then 4s, then 8s... between retries)
+Uses WebSocket transport, falling back to HTTP polling if WebSocket fails
+8. _emit_progress() and _create_milestone() (lines 338–401)
+These two functions report job status:
+
+Function    What it does
+_emit_progress()
+Sends a real-time progress update via Socket.IO (e.g., "20% — Analyzing patterns")
+_create_milestone()
+POSTs a "checkpoint reached" event to the API Layer (e.g., "EDA complete", "Report generated")
+In Local Mode both just print to the terminal instead.
+
+9. The HTTP Endpoints — register_routes() (lines 406–975)
+This is the most important section. It defines all the URLs the server responds to.
+
+GET /health
+→ Returns: { "status": "healthy", "service": "analysis-execution-api" }
+A simple ping. Used by monitoring tools (and Cloud Run itself) to check if the server is alive.
+
+POST /cancel
+→ Input: { "session_id": "...", "job_id": "..." }
+→ Output: { "status": "cancelled", ... }
+Marks a session or job for cancellation. The running agent will stop at its next safe checkpoint.
+
+POST /cancel/clear
+→ Input: { "session_id": "...", "job_id": "..." }
+→ Output: { "status": "cleared" }
+Clears a cancellation flag before starting a new job (so old flags don't interfere with fresh requests).
+
+POST /analyze_job — The Main Deep-Dive Endpoint (lines 504–551)
+→ Input: { "query": "...", "job_id": "...", "model": "gpt-4.1", "session_id": "...", ... }
+→ Output: { "status": "success", "costs": {...}, "metrics": {...}, ... }
+This is the primary endpoint for deep analysis. It:
+
+Creates a job-specific .lock file to prevent the same job running twice
+Calls run_job_analysis() which runs the full AI pipeline
+Returns the result (cost, metrics, output directory location)
+If the lock file already exists and force=true (default), the old lock is removed and analysis re-runs.
+
+POST /simpleqna/analyze_job — Quick Q&A with Job ID (lines 553–788)
+→ Input: { "query": "...", "query_id": "...", "chat_id": "...", "model": "gpt-4.1-mini", ... }
+→ Output: { "answer": "<html>...", "metrics": {...}, "error": null }
+Like the above but uses the lighter SimpleQnA agent (cheaper, faster). Used for quick conversational questions rather than deep reports. Returns an HTML answer directly in the response body.
+
+Flow:
+
+Creates a lock file
+Builds a state dictionary with all the context the agent needs
+Calls asyncio.run(self.simpleqna_agent.ainvoke(state)) — runs the async agent
+If the agent produced an HTML file on disk, ensures it's named analysis_report.html
+Returns the HTML answer + token metrics
+POST /analyze — Legacy Endpoint (lines 791–837)
+The old version of /analyze_job. Kept for backward compatibility. Works almost identically but uses a single global lock (not per-job) and a shared output directory.
+
+POST /simpleqna/query — Quick Q&A without Job ID (lines 839–975)
+Similar to simpleqna/analyze_job but works at the session level — no job ID required. Simpler flow, saves the HTML response to a timestamped file in the session directory.
+
+10. calculate_costs() (lines 977–1016)
+Calculates the dollar cost of an AI query based on how many tokens were used:
+
+cost = (prompt_tokens / 1000) × input_price_per_1k
+     + (completion_tokens / 1000) × output_price_per_1k
+Model prices (approximate):
+
+Model   Input (per 1K tokens)   Output (per 1K tokens)
+gpt-4.1
+$0.002
+$0.008
+gpt-4.1-mini
+$0.0004
+$0.0016
+gpt-4o-mini
+$0.00015
+$0.0006
+11. _generate_unsupported_query_report() (lines 1018–1062)
+When the AI determines that a user's question cannot be answered with the available data (e.g., "What is the weather today?" when you've uploaded sales data), this function generates a clean HTML page explaining why, with an orange warning title.
+
+12. create_graph() (lines 1065–1084)
+Builds a LangGraph pipeline — a directed graph where nodes are AI agents:
+
+[START] → [DataAnalysisAgent] → [END]
+LangGraph is a framework that chains AI agents together in a structured workflow. In this case there's just one node (the DataAnalysisAgent), but the graph framework allows adding more steps (EDA agent, hypothesis agent, etc.) which the DataAnalysisAgent orchestrates internally.
+
+13. run_job_analysis() — The Core Engine (lines 1086–1436)
+This is the most detailed function. Here's the full flow when a job runs:
+
+1. Extract parameters (job_id, query, model, session_id, user_email...)
+2. Resolve input/output file paths (_resolve_paths)
+3. IDEMPOTENCY CHECK: If analysis_report.html already exists → return cached result
+   (Prevents re-running if the HTTP request was retried after a dropped connection)
+4. Create job lock file (prevent duplicate runs)
+5. Create job output directory on disk
+6. Connect to API Layer for real-time progress streaming
+7. Initialize blank metrics state
+8. Clear any old cancellation flags
+9. Build the "state" dictionary — a big dict passed through the entire agent pipeline
+10. Create DataAnalysisAgent + LangGraph pipeline
+11. Run the pipeline: asyncio.run(compiled.ainvoke(state))
+12. Check if cancelled → return cancellation response
+13. Check if query_not_supportable → generate unsupported HTML report and return
+14. Calculate costs
+15. Read the analysis_report.html from disk (or use state["final_html_report"])
+16. Return full response dict: status, costs, metrics, output_dir, etc.
+17. [FINALLY] Remove lock file, remove job from active_jobs set
+The state dictionary is the "data package" that flows through all agents. It starts with the user's query and accumulates everything the agents produce: EDA outputs, hypothesis findings, charts, the final HTML report, metrics, errors, etc.
+
+14. run_analysis() — Legacy Version (lines 1438–1674)
+Older version of run_job_analysis(). Key differences:
+
+Uses a single global lock instead of per-job locks
+Doesn't use job-specific directories
+Has an extra token-limit check at the start (remaining_token <= 0)
+Kept alive so old API callers still work
+15. run() and create_app() (lines 1676–1693)
+def run(self, host='0.0.0.0', port=5001, debug=True):
+    port = int(os.getenv("PORT", str(port)))  # Cloud Run uses $PORT env var
+    self.app.run(debug=debug, host=host, port=port)
+def create_app():
+    api = ExecutionApi()
+    return api.app  # Used by WSGI servers like Gunicorn
+create_app() follows the Flask "Application Factory" pattern — it lets external tools (like Gunicorn, used in production) create the app without immediately starting a server.
+
+The Complete Request Flow (End to End)
+User types a question in the browser
+        ↓
+Frontend sends POST /analyze_job to the API Layer (separate server)
+        ↓
+API Layer creates a Job record, then calls POST /analyze_job on THIS server
+        ↓
+ExecutionApi receives the request
+        ↓
+Creates lock file → resolves file paths → clears cancellation flags
+        ↓
+Builds "state" dict with query, paths, model, callbacks...
+        ↓
+Creates DataAnalysisAgent + LangGraph graph → runs asyncio pipeline
+        ↓
+DataAnalysisAgent internally:
+  → Analyzes the query
+  → Runs EDA (Exploratory Data Analysis) on uploaded files
+  → Runs Python code to generate charts/statistics
+  → Synthesizes findings into an HTML report
+  → Saves analysis_report.html to the job output directory
+  → At each step, calls progress_callback() → _emit_progress() → Socket.IO → browser
+        ↓
+run_job_analysis() reads the report file, calculates costs
+        ↓
+Returns JSON: { status: "success", costs: {...}, metrics: {...} }
+        ↓
+API Layer updates the Job record in Firestore, notifies the browser
+        ↓
+Browser fetches and displays the HTML report to the user
+Summary Table of All Endpoints
+Endpoint    Method  Purpose Agent Used
+/health
+GET
+Server health check
+None
+/cancel
+POST
+Stop a running job
+None
+/cancel/clear
+POST
+Clear stop flag
+None
+/analyze_job
+POST
+Deep analysis with job ID
+DataAnalysisAgent
+/simpleqna/analyze_job
+POST
+Quick Q&A with job ID
+SimpleQnaDataAnalysisAgent
+/analyze
+POST
+Legacy deep analysis
+DataAnalysisAgent
+/simpleqna/query
+POST
+Quick Q&A, session-only
+SimpleQnaDataAnalysisAgent
+explain me the functioning of execution_api.py in short along with all the agents.
+
+Now I have everything I need. Here is the short but complete explanation.
+
+
+
+
+How execution_api.py Works — With All Agents
+The Big Picture
+execution_api.py is a Flask web server that acts as a factory manager. It receives a user's question, hands it to a chain of AI agents (workers), and returns an HTML analysis report. There are two separate pipelines — one for deep analysis and one for quick Q&A.
+
+The Two Pipelines
+                        ┌──────────────────────────────────────────────────────┐
+                        │              execution_api.py (Flask Server)          │
+                        │                                                        │
+User Question ──────────► POST /analyze_job ──────► run_job_analysis()          │
+                        │                                   │                   │
+                        │                                   ▼                   │
+                        │                        DataAnalysisAgent  ◄─ PIPELINE 1 (Deep Dive)
+                        │                                                        │
+User Question ──────────► POST /simpleqna/analyze_job ──► SimpleQnaAgent ◄─ PIPELINE 2 (Quick Q&A)
+                        └──────────────────────────────────────────────────────┘
+Pipeline 1 — Deep Dive Analysis (/analyze_job)
+This is the full-power pipeline. It has 4 agents running in sequence, each passing their output to the next via a shared state dictionary.
+
+User Question
+     │
+     ▼
+┌─────────────────────────────┐
+│   1. DataAnalysisAgent      │  ← ORCHESTRATOR (conductor of the whole orchestra)
+│   (data_analysis_agent.py)  │
+│                             │
+│  Step 1: Analyze the query  │  ← Asks GPT: "Can this question be answered with the data?"
+│          (LLM call)         │    → Produces: sub_queries, plan, expected_output
+│                             │    → If NOT supportable → returns "Query Cannot Be Supported" HTML
+│                             │
+│  Step 2: Run EDA Agent ─────┼──────────────────────────────────────────────────┐
+│                             │                                                    │
+│  Step 3: Run Hypothesis ────┼──────────────────────────────────────────────────┼──┐
+│          Agent              │                                                    │  │
+│                             │                                                    │  │
+│  Step 4: Run Narrator  ─────┼──────────────────────────────────────────────────┼──┼──┐
+│          Agent              │                                                    │  │  │
+│                             │                                                    │  │  │
+│  Step 5: Save Report        │  ← Converts images to base64, saves HTML to disk  │  │  │
+└─────────────────────────────┘                                                    │  │  │
+                                                                                   │  │  │
+         ┌─────────────────────────────────────────────────────────────────────────┘  │  │
+         ▼                                                                             │  │
+┌─────────────────────┐                                                               │  │
+│  2. EDAAgent        │  ← Exploratory Data Analysis                                  │  │
+│  (eda_agent.py)     │                                                               │  │
+│                     │  → Asks GPT to break query into ~5 sub-tasks                  │  │
+│                     │  → For each sub-task, generates Python code                   │  │
+│                     │  → CodeAgent executes the code on the actual data files        │  │
+│                     │  → Produces: charts, tables, statistics, eda_summary          │  │
+└─────────────────────┘                                                               │  │
+                                                                                      │  │
+         ┌────────────────────────────────────────────────────────────────────────────┘  │
+         ▼                                                                                │
+┌──────────────────────────┐                                                             │
+│  3. HypothesisAgent      │  ← Statistical Hypothesis Testing                          │
+│  (hypothesis_agent.py)   │                                                             │
+│                          │  → Reads eda_summary from state                             │
+│                          │  → Asks GPT to generate testable hypotheses                 │
+│                          │  → Generates Python code to test each hypothesis            │
+│                          │  → CodeAgent executes the tests                             │
+│                          │  → Produces: hypothesis_findings, hypothesis_summary        │
+└──────────────────────────┘   (SKIPPED in "slim" analysis mode)                        │
+                                                                                         │
+         ┌───────────────────────────────────────────────────────────────────────────────┘
+         ▼
+┌──────────────────────────┐
+│  4. NarratorAgent        │  ← Report Writer
+│  (narrator_agent.py)     │
+│                          │  → Receives: eda_summary + hypothesis_findings + charts
+│                          │  → Uses GPT Vision to analyze each chart image
+│                          │  → Asks GPT to write a McKinsey-style executive report
+│                          │  → CodeAgent generates final HTML layout/styling
+│                          │  → Produces: final_html_report (saved as analysis_report.html)
+└──────────────────────────┘
+Pipeline 2 — Quick Q&A (/simpleqna/analyze_job)
+A lighter, cheaper, faster pipeline for conversational questions.
+
+User Question
+     │
+     ▼
+┌────────────────────────────────┐
+│  SimpleQnaDataAnalysisAgent    │  ← Single agent (simpleqna_data_analysis.py)
+│                                │
+│  → Asks GPT to plan the query  │  (1 LLM call)
+│  → Generates Python code       │  (1 LLM call)
+│  → CodeAgent executes the code │
+│  → Asks GPT to write HTML answer│ (1 LLM call)
+│  → Returns HTML answer          │
+└────────────────────────────────┘
+Much fewer LLM calls, no hypothesis testing, no elaborate report — just a direct HTML answer.
+
+The Supporting Agents / Utilities
+These aren't called directly by execution_api.py — they are used internally by the agents above.
+
+File    Role
+executor.py / CodeAgent
+The code runner. Receives Python code generated by GPT, executes it in a subprocess on the real data files, captures output (charts, tables, printed results), handles retry on errors
+token_manager.py
+Tracks token (API cost) limits. Before every LLM call, checks if the user has tokens remaining. If limit is hit mid-job, it calls complete_job_gracefully() to wrap up what's been done so far instead of crashing
+analysis_mode.py
+Controls pipeline behavior based on mode (e.g., deep_dive vs slim). Determines: how many EDA tasks to run, whether to skip hypothesis testing, how verbose the narrator should be, max retry attempts for code execution
+narrator_agent.py → simpleqna_executor.py
+A specialized executor variant used by the SimpleQnA agent
+perf_utils.py
+Logs CPU/memory resource usage for performance monitoring
+The state Dictionary — The Data Bus
+The most important concept: all agents communicate through a single shared dictionary called state. It starts with the user's question and grows as each agent adds its output.
+
+state = {
+  "original_query":       "Show me sales trends by region",
+  "query_analysis":       { sub_queries, plan, expected_output },  ← Added by DataAnalysisAgent Step 1
+  "eda_outputs":          [ list of chart paths, tables ],          ← Added by EDAAgent
+  "eda_summary":          "Revenue peaks in Q3...",                 ← Added by EDAAgent
+  "hypothesis_findings":  [ { hypothesis, result, chart } ],        ← Added by HypothesisAgent
+  "hypothesis_summary":   "Sales are significantly higher...",      ← Added by HypothesisAgent
+  "final_html_report":    "<html>...</html>",                       ← Added by NarratorAgent
+  "metrics":              { prompt_tokens, completion_tokens, ... }, ← Updated after every LLM call
+  "cancellation_manager": <object>,   ← Checked at every checkpoint for user's "Stop" click
+  "progress_callback":    <function>, ← Called at each step to send live progress to browser
+  "milestone_callback":   <function>, ← Called at major steps to record checkpoints
+  "cancelled":            False,      ← Set to True if user cancels mid-job
+  "error":                None,       ← Set if something goes wrong
+}
+Complete Flow Summary
+Browser sends question
+         │
+         ▼
+execution_api.py receives POST /analyze_job
+         │
+         ├─ Creates lock file (prevents same job running twice)
+         ├─ Resolves file paths (where is the user's data?)
+         ├─ Builds the state dict
+         │
+         ▼
+DataAnalysisAgent.ainvoke(state)
+         │
+         ├─ [LLM] Analyzes query → is it answerable? → query_analysis
+         ├─ [EDAAgent] Explores data → charts + eda_summary
+         │     └─ [CodeAgent] Runs Python code on user's data files
+         ├─ [HypothesisAgent] Tests statistical hypotheses
+         │     └─ [CodeAgent] Runs Python stat tests
+         ├─ [NarratorAgent] Writes executive HTML report
+         │     └─ [LLM Vision] Analyzes chart images
+         │     └─ [LLM] Writes McKinsey-style narrative
+         │     └─ [CodeAgent] Generates final styled HTML
+         └─ Saves analysis_report.html to disk
+         │
+         ▼
+execution_api.py reads report, calculates cost
+         │
+         ▼
+Returns JSON: { status, costs, metrics, output_dir }
+         │
+         ▼
+API Layer notifies browser → user sees the report
+what is the architecture of the overall execution layet? which model is used in this? is there any impplementation of rag and vector db? which llm model is used and how the orchestration is done?
+
+Now I have a complete, accurate picture. Here is the full architecture breakdown.
+
+Overall Architecture of the Execution Layer
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        EXECUTION LAYER                                       │
+│                                                                               │
+│  ┌──────────────────────────────────────────────────────────────────────┐    │
+│  │                    execution_api.py  (Flask HTTP Server)             │    │
+│  │                                                                       │    │
+│  │   /analyze_job ──────► run_job_analysis() ──► LangGraph Pipeline     │    │
+│  │   /simpleqna/analyze_job ──────────────────► SimpleQna Pipeline      │    │
+│  │   /health, /cancel, /cancel/clear  (utility endpoints)               │    │
+│  └──────────────────────────────────────────────────────────────────────┘    │
+│          │                                       │                            │
+│          ▼                                       ▼                            │
+│  ┌──────────────────┐               ┌─────────────────────────┐              │
+│  │  Deep Dive       │               │  Simple QnA Pipeline    │              │
+│  │  Pipeline        │               │  (simpleqna_data_       │              │
+│  │  (LangGraph)     │               │   analysis.py)          │              │
+│  │                  │               │                         │              │
+│  │ DataAnalysis     │               │ 1. Plan query (LLM)     │              │
+│  │ Agent            │               │ 2. Generate code (LLM)  │              │
+│  │  │               │               │ 3. Execute code         │              │
+│  │  ├─ EDAAgent     │               │    (JupyterKernel)      │              │
+│  │  │   └─CodeAgent │               │ 4. Synthesize HTML (LLM)│              │
+│  │  ├─ HypothesisAgt│               └─────────────────────────┘              │
+│  │  │   └─CodeAgent │                                                         │
+│  │  └─ NarratorAgent│                                                         │
+│  │      └─CodeAgent │                                                         │
+│  └──────────────────┘                                                         │
+│          │                                                                     │
+│          ▼                                                                     │
+│  ┌───────────────────────┐                                                    │
+│  │  coding_tool.py       │  ← JupyterExecutionTool                           │
+│  │  (Live Jupyter Kernel)│    Runs actual Python code on user's data files   │
+│  └───────────────────────┘                                                    │
+│                                                                               │
+│  Supporting utilities:                                                        │
+│  analysis_mode.py  → Controls pipeline depth/cycles/tasks                    │
+│  token_manager.py  → Tracks OpenAI API token usage and cost                  │
+│  logger.py         → Thread-safe logging per job                             │
+│  image_master.py   → JSON registry of all generated chart images             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+
+
+
+
+also you said that langraph is used so mcp is defined or it hasnt been used?
+
+Now I have a very clear and complete answer.
+
+MCP — Not Defined, Not Used
+MCP (Model Context Protocol) is completely absent from this codebase. The search found zero matches across all files for any MCP-related term.
+
+What LangGraph Features ARE Actually Used
+LangGraph is imported in only one file (execution_api.py) and only uses the most basic, minimal part of it:
+
+        from langgraph.graph import Graph
+        
+        g = Graph()
+        
+        # Create main data analysis agent
+        data_analysis_agent = DataAnalysisAgent(output_dir=self.output_dir)
+        
+        # Add node
+        g.add_node("data_analysis_agent", data_analysis_agent)
+        
+        # Set entry and exit points
+        g.set_entry_point("data_analysis_agent")
+        g.set_finish_point("data_analysis_agent")
+        
+        return g.compile()
+That's it. Only three LangGraph things are used:
+
+Graph() — creates a graph object
+add_node, set_entry_point, set_finish_point — wires one single node
+.compile() — compiles it for execution
+What LangGraph Features Are NOT Used
+LangGraph Feature   Used?   What it does
+StateGraph
+No
+Graph with typed state management between nodes
+ToolNode
+No
+A node that automatically calls LLM tools
+create_react_agent
+No
+Pre-built ReAct agent with tool-calling loop
+langgraph.prebuilt
+No
+Pre-built agent patterns
+Conditional edges
+No
+Route between different agents based on state
+Checkpointing / persistence
+No
+Save/resume graph state
+Multi-agent routing
+No
+Pass control between multiple agents based on LLM decisions
+MCP integration
+No
+Connect to external tool serve
+
+
+
+
+what can be the reason behind 7 minutes of time used by llm to answer the query?
+
+Now I have everything I need. Here is a thorough breakdown of every reason contributing to that 7-minute runtime.
+
+Why the LLM Pipeline Takes ~7 Minutes
+There is no single cause — it is the accumulation of many sequential steps, each adding latency. Here is every bottleneck found in the code.
+
+1. Enormous Number of Sequential LLM API Calls
+Every LLM call to OpenAI takes 2–15 seconds depending on prompt size and model. Count how many happen in a single deep-dive job:
+
+Stage   LLM Calls   Notes
+Query Analysis
+1
+Plans sub-queries, checks supportability
+EDA — Task Planning
+1 per cycle
+Plans 5 tasks per cycle
+EDA — Code Generation
+5 per cycle × 2 cycles = 10
+1 LLM call per task to generate Python code
+EDA — Retry on failure
+up to 2 retries × 10 tasks = 20 more
+Each failed code execution → new LLM call with error context
+EDA — Completeness Check
+1 per cycle
+"Is analysis sufficient?" LLM call
+EDA — Vision Analysis
+1 per image × up to 10 images = 10
+Each chart is analyzed by GPT Vision individually
+EDA — Synthesis
+1
+Summarize all EDA findings
+Hypothesis — Generation
+1
+Generates 3 hypotheses from EDA summary
+Hypothesis — Command Gen
+1 per hypothesis × 3 = 3
+Each hypothesis gets its own LLM planning call
+Hypothesis — Code Gen
+1 per hypothesis × 3 = 3
+Code to test each hypothesis
+Hypothesis — Judging
+1 per hypothesis × 3 = 3
+Judge/interpret test results
+Narrator — Vision Analysis
+1 per chart again × up to 10 = 10
+NarratorAgent re-analyzes charts for the report
+Narrator — Final Report
+1
+Large gpt-4.1 call writing a McKinsey-style HTML report
+Conservative total: 30–60+ sequential LLM API calls per job. At 3–5 seconds average each → 2–5 minutes from API calls alone.
+
+2. All Stages Are Sequential — Zero Parallelism Between Agents
+# In DataAnalysisAgent.ainvoke():
+query_analysis = await self.analyze_user_query(...)   # Must finish first
+state = await eda_agent.ainvoke(state)                 # Then this
+state = await hypothesis_agent.ainvoke(state)          # Then this
+state = await narrator_agent.ainvoke(state)            # Then this
+Each stage waits for the previous one to fully complete before starting. There is no concurrent execution between agents. EDA cannot run while hypothesis is already being planned, etc.
+
+3. EDA Tasks Also Run Sequentially Inside EDA Agent
+Inside EDAAgent, the 5 tasks per cycle run one at a time through execute_task() — each involving an LLM call, then Jupyter execution, then waiting for the output. There is no asyncio.gather() across the 5 tasks.
+
+4. Jupyter Kernel Cold Start
+class JupyterExecutionTool:
+    def __init__(self):
+        self.km = KernelManager()
+        self.km.start_kernel()     # ← Cold start every time
+        self.kc = self.km.client()
+        self.kc.start_channels()
+        self._setup_kernel()       # ← Runs setup code (imports, patches)
+Starting a Jupyter kernel and loading pandas, numpy, matplotlib, seaborn takes 5–15 seconds. This happens at least once per agent (EDA, Hypothesis, and Narrator each lazily create their own CodeAgent). The comment in the code even calls this out:
+
+        # Lazily created. Creating a new CodeAgent per task was extremely slow
+        # and could cause memory pressure (each CodeAgent starts a Jupyter kernel).
+So it was already optimized to reuse one kernel per agent, but you still get 3 kernel startups (EDA + Hypothesis + Narrator) per job.
+
+5. Code Retry Loops Add Multiplied Latency
+# In CodeAgent
+self.max_retries = 3
+When the LLM generates Python code that fails (wrong column name, type error, import error), the pipeline:
+
+Captures the error
+Makes another LLM call: "Fix this code given this error"
+Executes again
+Repeats up to 3 times
+For 10 EDA tasks + 3 hypothesis tests = 13 possible retry chains, each potentially tripling the time for that task.
+
+6. Vision Analysis Is Rate-Limited to 3 Concurrent Calls
+semaphore = asyncio.Semaphore(3)  # Only 3 image analyses at a time
+results = await asyncio.gather(*[_with_limit(p) for p in found_images])
+Up to 10 images → at most 3 analyzed at a time → 4 batches of vision calls. Each vision call (sending base64 image to GPT) is slow because of the large payload. And this happens twice — once in EDAAgent, once in NarratorAgent.
+
+7. Intentional asyncio.sleep() Delays for Thinking Logs
+for i, log in enumerate(thinking_logs):
+    progress_callback(f"🤖 LLM Thinking #{i+1}", log, "🧠")
+    await asyncio.sleep(0.2)   # ← Artificial 200ms delay per log
+Each LLM response returns 4–6 thinking logs. With ~15+ LLM calls having thinking logs:
+
+15 calls × 5 logs × 200ms = 15 seconds of intentional artificial delay
+8. Massive System Prompts = Slower LLM Responses
+The system prompts in the codebase are enormous. The executor.py system prompt alone is 160+ lines of detailed instructions about image master rules, path building, indentation rules, error handling, etc. Larger input token counts mean:
+
+More tokens to process → higher OpenAI latency
+More tokens billed → slower response times for complex prompts on gpt-4.1
+9. Large Data Files in Jupyter Execution
+When the Jupyter kernel loads .pkl dataset files with pd.read_pickle(), the actual data loading + computation time adds up. For large datasets (100k+ rows), operations like groupby, pivot tables, correlation matrices, and plot rendering can each take 10–30 seconds of actual CPU time in the kernel.
+
+10. HTML Report Post-Processing
+At the end, DataAnalysisAgent runs:
+
+base64_original_html = await asyncio.get_event_loop().run_in_executor(
+    None,
+    lambda: convert_images_to_base64_for_report(
+        html_content=original_html, output_dir=self.output_dir
+    )
+)
+This reads every chart image from disk, base64-encodes it, and inlines it into the HTML. For 10 large PNG files this can take 10–20 seconds of I/O + encoding time.
+
+Visual Time Budget for a Typical Deep-Dive Job
+Cold start (server/kernel)              ~  5–15 s
+Query Analysis LLM call                 ~  3–8 s
+EDA: Task planning (1 LLM call)         ~  3–5 s
+EDA: 10 code gen + execute cycles       ~ 60–120 s  (6–12s each)
+EDA: Code retries (if any)              ~ 20–60 s
+EDA: Vision analysis (10 images)        ~ 30–60 s
+EDA: Synthesis LLM call                 ~  5–10 s
+Hypothesis: Generate (1 LLM)            ~  5–10 s
+Hypothesis: 3× command gen              ~ 10–20 s
+Hypothesis: 3× code gen + execute       ~ 20–40 s
+Hypothesis: 3× judge LLM calls          ~ 10–20 s
+Narrator: Vision re-analysis            ~ 20–40 s
+Narrator: Final report (gpt-4.1)        ~ 15–30 s
+Base64 image encoding + save            ~ 10–20 s
+Artificial sleep delays (thinking logs) ~ 10–20 s
+──────────────────────────────────────────────────
+TOTAL                                   ~ 4–8 minutes
+Summary of Root Causes
+Root Cause  Time Added
+30–60 sequential LLM API calls
+Largest contributor (~3–5 min)
+No parallelism between agents
+Prevents any time savings
+3 Jupyter kernel startups
+~15–45 seconds
+Code retry loops
+Up to 2–3× multiplier on failed tasks
+Double vision analysis (EDA + Narrator)
+~1–2 min
+Massive system prompts → slow LLM
+20–30% slower per call
+Artificial sleep() for UI logs
+~15 seconds
+Base64 image encoding
+~10–20 seconds
+Actual data computation in Jupyter
+Depends on dataset size
+
+
+
+
+
+Now I have a complete and precise picture of every dependency. Here is a thorough analysis of everything that can be parallelized, why, and how.
+
+Dependency Map — What Blocks What
+First, understand what is truly sequential (cannot be parallelized) vs what only appears sequential:
+
+[Query Analysis] ──────────────────────────────────────── MUST be first (everything depends on it)
+        │
+        ▼
+[EDA Agent]
+  ├── Plan 5 tasks (1 LLM call)  ─── MUST be first within EDA
+  ├── Task 1: LLM code gen → Jupyter execute ─┐
+  ├── Task 2: LLM code gen → Jupyter execute ─┤ ← CURRENTLY sequential, tasks are INDEPENDENT
+  ├── Task 3: LLM code gen → Jupyter execute ─┤   (but share one Jupyter kernel — the blocker)
+  ├── Task 4: LLM code gen → Jupyter execute ─┤
+  ├── Task 5: LLM code gen → Jupyter execute ─┘
+  ├── Completeness check (1 LLM call) ──── after all tasks
+  ├── Vision analysis (up to 10 images) ── after tasks generate charts ← PARTIALLY parallel already
+  └── Synthesis (1 LLM call) ────────────── needs vision + task outputs
+        │
+        ▼
+[Hypothesis Agent]   ← needs eda_summary from EDA
+  ├── Generate 3 hypotheses (1 LLM call)
+  ├── Hyp 1: command gen → code execute → judge ─┐
+  ├── Hyp 2: command gen → code execute → judge ─┤ ← CURRENTLY sequential, each is INDEPENDENT
+  ├── Hyp 3: command gen → code execute → judge ─┘   (milestone even labels them "parallelizable")
+  └── Synthesize all judge summaries (sequential by design — incremental)
+        │
+        ▼
+[Narrator Agent]     ← needs eda_summary + hypothesis_findings
+  ├── Vision analysis (same charts AGAIN) ─── REDUNDANT with EDA's vision
+  └── Final report (1 large gpt-4.1 call)
+All Parallelization Opportunities
+Opportunity 1 — EDA Tasks: Parallel Code Generation (Easy Win)
+Currently: 5 tasks, each does LLM call → execute → wait → next task.
+
+What can be parallelized: The LLM code generation for all 5 tasks is completely independent — no task needs another task's code to generate its own code. You can fire all 5 LLM calls simultaneously:
+
+# CURRENT (sequential)
+for task in current_tasks:
+    result = await code_agent.ainvoke(state)
+# PROPOSED: Parallel code generation
+code_generation_calls = [
+    code_agent.nl_to_code(task["code_instruction"], history, state=state)
+    for task in current_tasks
+]
+all_codes = await asyncio.gather(*code_generation_calls)
+# Then execute sequentially (kernel constraint)
+for code, task in zip(all_codes, current_tasks):
+    result = kernel.execute(code)
+Savings: 5 LLM calls at ~3-5s each = ~15-25s saved per cycle. With 2 cycles = ~30-50s.
+
+Opportunity 2 — EDA Tasks: Fully Parallel Execution (Big Win, Complex)
+The blocker today: All 5 EDA tasks share one Jupyter kernel (_get_code_agent() returns the same CodeAgent instance). Task 2 can use variables defined by Task 1 (df is still in memory). This is intentional — the code uses state["history"] to pass prior outputs as context.
+
+Two approaches to fix this:
+
+Approach 2A — Separate Kernel Per Task (Full Parallelism)
+Give each task its own CodeAgent (its own Jupyter kernel). They are fully isolated.
+
+async def execute_task_isolated(task, state):
+    isolated_agent = CodeAgent()      # own kernel
+    isolated_state = {**state}        # shallow copy
+    isolated_state["history"] = []    # no shared history
+    result = await isolated_agent.ainvoke(isolated_state)
+    isolated_agent.executor.cleanup() # kill kernel after
+    return result
+results = await asyncio.gather(*[
+    execute_task_isolated(task, state) for task in current_tasks
+])
+Trade-offs:
+
+Saves 60-70% of EDA execution time
+Each kernel startup costs ~5-15s (but this is in parallel so only counted once)
+5 kernels × RAM per kernel = higher memory usage (~500MB total)
+Tasks can't use each other's in-memory variables — each must reload the dataset from disk independently (not a real problem since domain_directory.json and .pkl files are on disk)
+Approach 2B — Pre-load Datasets Once, Share via Files (Safer)
+Load all datasets at the start of EDA, save them as parquet/feather files, have each parallel task read from those. This avoids re-reading .pkl files per task and gives each kernel a shared starting state via disk.
+
+Opportunity 3 — Hypothesis Tests: Fully Parallel (Easiest Big Win)
+This is the clearest parallelization opportunity in the entire codebase. The milestone metadata in the code itself already labels each hypothesis step as "dependency": "parallelizable":
+
+                milestone_cb(f"Hypothesis: Test executed {hypothesis['id']}", "hypothesis_test_executed", {"hypothesis_id": hypothesis["id"], "dependency": "parallelizable", "is_llm_call": False})
+Currently sequential:
+
+for hypothesis in hypotheses:
+    execution_result = await self.execute_hypothesis_test(hypothesis, state)
+    await self.judge_hypothesis(execution_result, state)
+Each hypothesis is completely independent — different file names (hypothesis_1_*.png, hypothesis_2_*.png), different commands, different code, different judge summaries.
+
+Proposed:
+
+async def run_single_hypothesis(hypothesis, state):
+    # Give each hypothesis its own kernel to avoid conflicts
+    local_agent = CodeAgent()
+    local_state = {**state, "history": []}
+    execution_result = await self.execute_hypothesis_test(hypothesis, local_state, agent=local_agent)
+    await self.judge_hypothesis(execution_result, local_state)
+    local_agent.executor.cleanup()
+await asyncio.gather(*[
+    run_single_hypothesis(h, state) for h in hypotheses
+])
+# Then synthesize (must be sequential — reads all judge files)
+synthesis = await self.synthesize_hypothesis_results(state)
+Savings: 3 hypotheses × ~40s each = ~120s total → reduced to ~40s (longest single hypothesis). That's ~80s saved.
+
+Opportunity 4 — Hypothesis Command Generation: Parallel (Easy)
+Inside each hypothesis, the first step is generate_hypothesis_command() — an LLM call that generates a testing instruction. These 3 command-generation calls are independent and can be asyncio.gather'ed:
+
+# Generate all commands in parallel
+commands = await asyncio.gather(*[
+    self.generate_hypothesis_command(h, input_files, domain_directory, state)
+    for h in hypotheses
+])
+# Then execute each (with separate kernels)
+Savings: 3 LLM calls × ~3-5s = ~10-15s.
+
+Opportunity 5 — Eliminate Double Vision Analysis (Structural Fix)
+This is a clear redundancy in the current architecture:
+
+EDAAgent.analyze_images() calls GPT Vision on each chart → stores result in state["vision_analysis"]
+NarratorAgent then calls GPT Vision on the same charts again for the final report
+The results are the same — both analyze the same PNG files. The fix is simple: pass EDA's existing vision analysis directly to Narrator instead of re-running it.
+
+# In DataAnalysisAgent.ainvoke(), pass vision to Narrator:
+state = await eda_agent.ainvoke(state)   # vision_analysis is now in state
+state = await narrator_agent.ainvoke(state)  # Narrator uses state["vision_analysis"] directly
+Savings: Up to 10 vision calls × ~3-5s = ~30-50s saved, zero accuracy loss.
+
+Opportunity 6 — EDA Vision Analysis: Stream During Task Execution
+Currently: All 5 tasks finish → then vision analysis starts.
+
+Better approach: Use an async queue — as soon as a task generates a chart (detected via plt.savefig in output), immediately start analyzing it while the next task runs:
+
+image_queue = asyncio.Queue()
+# Producer: tasks put image paths into queue as they appear
+# Consumer: vision analysis processes images as they arrive
+async def vision_consumer():
+    while True:
+        img_path = await image_queue.get()
+        if img_path is None:
+            break
+        analysis = await self._analyze_single_image(img_path, state)
+        vision_results.append(analysis)
+consumer_task = asyncio.create_task(vision_consumer())
+# Run EDA tasks — each puts generated image paths into queue
+# Vision analysis runs concurrently with task execution
+Savings: Completely overlaps ~30-60s of vision analysis with task execution time.
+
+Opportunity 7 — Overlap EDA and Hypothesis at the Agent Level
+Currently in DataAnalysisAgent.ainvoke():
+
+state = await eda_agent.ainvoke(state)         # EDA must finish 100%
+state = await hypothesis_agent.ainvoke(state)  # Then hypothesis starts
+Observation: HypothesisAgent only needs state["eda_summary"] and state["eda_outputs"]. These are ready after EDA synthesis, but EDA synthesis happens before EDA vision analysis in the current code. Actually looking at the code, EDA does vision before synthesis:
+
+vision_report = await self.analyze_images(state)   # step 4
+state["eda_summary"] = await self.synthesize_results(...)  # step 5
+So once eda_summary exists, Hypothesis can start. We could restructure so that Hypothesis generation and Narrator preparation run in parallel after EDA:
+
+# After EDA finishes:
+eda_summary_ready = True
+# Run both in parallel:
+await asyncio.gather(
+    hypothesis_agent.ainvoke(state),  # needs eda_summary ✓
+    narrator_agent.prepare_structure(state)  # pre-loads vision, structures outline
+)
+# Then narrator writes final report using hypothesis results
+Savings: ~1-2 minutes if Hypothesis and Narrator preparation are truly overlappable.
+
+Opportunity 8 — Remove asyncio.sleep(0.2) Delays
+Found across multiple agents:
+
+for i, log in enumerate(thinking_logs):
+    progress_callback(f"🤖 LLM Thinking #{i+1}", log, "🧠")
+    await asyncio.sleep(0.2)    # ← artificial delay for UI visibility
+With ~15 LLM calls × 5 logs × 0.2s = 15 seconds of pure waiting. This can be reduced to 0.05s or removed entirely since the frontend can handle log streaming at full speed.
+
+
+
+Summary: Estimated Time Savings Per Approach
+#   Opportunity Effort  Savings Risk
+1
+Parallel LLM code generation for EDA tasks
+Low
+~30-50s
+Low
+2A
+Parallel EDA task execution (separate kernels)
+High
+~90-120s
+Medium (memory)
+3
+Parallel hypothesis tests (separate kernels)
+Medium
+~80s
+Low
+4
+Parallel hypothesis command generation
+Low
+~15s
+Low
+5
+Eliminate double vision analysis
+Low
+~30-50s
+None
+6
+Stream vision analysis during EDA tasks
+Medium
+~30-60s
+Low
+7
+Overlap EDA→Hypothesis→Narrator
+High
+~60-120s
+Medium
+8
+Remove asyncio.sleep(0.2) delays
+Very Low
+~15s
+None
+Conservative combined savings with opportunities 1, 3, 4, 5, 8 (all low-effort): ~170-210 seconds = ~3 minutes saved, cutting total time from 7 min to ~4 min.
+
+With full parallelization (all opportunities): ~4-5 minutes saved, cutting to ~2-3 minutes total.
+
+Recommended Priority Order
+1. QUICK WINS (do first):
+   → Remove double vision analysis (#5)      ← zero accuracy loss, ~2 lines of change
+   → Reduce asyncio.sleep() (#8)             ← 1-line change
+   → Parallel hypothesis command gen (#4)    ← simple asyncio.gather
+2. MEDIUM EFFORT, HIGH IMPACT:
+   → Parallel hypothesis tests (#3)          ← separate kernel per hypothesis
+   → Parallel EDA code generation (#1)       ← gather LLM calls, keep sequential execution
+3. COMPLEX, HIGHEST IMPACT:
+   → Parallel EDA task execution (#2A)       ← separate kernels, dataset re-loading
+   → Pipeline overlap EDA↔Hypothesis (#7)   ← architectural restructuring

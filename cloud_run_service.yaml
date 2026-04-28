@@ -1,0 +1,43 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: exec-SESSION_PLACEHOLDER
+  namespace: PROJECT_PLACEHOLDER
+  annotations:
+    run.googleapis.com/ingress: all
+    # Prevent unexpected scale-out and keep console "Max instances" consistent.
+    run.googleapis.com/maxScale: "1"
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/client-name: deep-analysis-api
+        run.googleapis.com/execution-environment: "gen2"
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "1"
+    spec:
+      serviceAccountName: SERVICE_ACCOUNT_PLACEHOLDER
+      containerConcurrency: 1
+      timeoutSeconds: 3600
+      containers:
+        - image: IMAGE_PLACEHOLDER
+          volumeMounts:
+            - name: gcs-volume
+              mountPath: /data
+          env:
+            - name: GCS_BUCKET
+              value: BUCKET_PLACEHOLDER
+            - name: DATA_DIR
+              value: /data
+            # api_layer_url is injected at deploy-time by the API layer (single source of truth: env/.env)
+          resources:
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+      volumes:
+        - name: gcs-volume
+          csi:
+            driver: gcsfuse.run.googleapis.com
+            readOnly: false
+            volumeAttributes:
+              bucketName: BUCKET_PLACEHOLDER

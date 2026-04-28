@@ -1,0 +1,8 @@
+{
+  "projects": {
+    "default": "insightbot-467305",
+    "dev": "insightbot-dev-474509"
+  },
+  "targets": {},
+  "etags": {}
+}
