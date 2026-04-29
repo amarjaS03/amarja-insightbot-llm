@@ -27,3 +27,4 @@ ngrok-v3-stable-windows-amd64/
 
 # Local job/runtime data (do not push)
 local_data_dir/
+execution_layer/_local_data/
