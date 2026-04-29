@@ -3,12 +3,13 @@ import json
 import logging
 import asyncio
 
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from agents.llm_client import llm_call
 from langchain_core.runnables import Runnable
 
 from execution_layer.agents.coding_tool import JupyterExecutionTool
 from agents.analysis_mode import normalize_analysis_mode, executor_max_attempts
+from agents.llm_client import ENFORCED_MODEL
 from agents.token_manager import check_token_limit_internal, complete_job_gracefully, TokenLimitExceededException
 
 # load .env
@@ -232,7 +233,9 @@ class CodeAgent(Runnable):
     def __init__(self):
         # spin up a persistent Jupyter kernel
         self.executor = JupyterExecutionTool()
-        self.max_retries = 1
+        self.max_retries = 3
+        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.model = (os.getenv("MODEL_NAME") or ENFORCED_MODEL).strip() or ENFORCED_MODEL
 
     def _compact_history_for_prompt(self, history: list, *, max_items: int = 4) -> str:
         """
@@ -355,23 +358,36 @@ class CodeAgent(Runnable):
             
             # print(f"[EXECUTOR] {token_message}")
             
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg},
-            ]
-            content, usage = await llm_call(messages, json_response=True, max_output_tokens=8000)
-            if not content:
-                content = "{}"
-
+            resp = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg}
+                ],
+                text={"format": {"type": "json_object"}},
+                max_output_tokens=8000
+            )
+            
             # Update metrics in state if available
             if state and "metrics" in state:
-                state["metrics"]["prompt_tokens"] += usage["input_tokens"]
-                state["metrics"]["completion_tokens"] += usage["output_tokens"]
-                state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+                state["metrics"]["prompt_tokens"] += getattr(resp.usage, "input_tokens", 0) if hasattr(resp, "usage") else 0
+                state["metrics"]["completion_tokens"] += getattr(resp.usage, "output_tokens", 0) if hasattr(resp, "usage") else 0
+                state["metrics"]["total_tokens"] += (
+                    (getattr(resp.usage, "input_tokens", 0) + getattr(resp.usage, "output_tokens", 0)) if hasattr(resp, "usage") else 0
+                )
                 state["metrics"]["successful_requests"] += 1
-
-            tokens_used = usage["input_tokens"] + usage["output_tokens"]
-            print(f"[EXECUTOR] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
+            
+            # Log token usage for this call
+            if hasattr(resp, "usage") and resp.usage:
+                tokens_used = getattr(resp.usage, "input_tokens", 0) + getattr(resp.usage, "output_tokens", 0)
+                print(f"[EXECUTOR] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
+            
+            content = getattr(resp, "output_text", None)
+            if not content:
+                try:
+                    content = resp.output[0].content[0].text
+                except Exception:
+                    content = "{}"
             
             try:
                 result = json.loads(content)
@@ -383,7 +399,7 @@ class CodeAgent(Runnable):
                 for i, log in enumerate(thinking_logs):
                     progress_callback(f"🤖 Code Gen #{i+1}", log, "⚙️")
                     # Small delay to make logs visible
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.03)
                 
                 code = result.get("code", "")
             except json.JSONDecodeError:
@@ -404,7 +420,7 @@ class CodeAgent(Runnable):
             
         except Exception as e:
             logger.error(f"Error generating code: {e}")
-            raise RuntimeError(f"Error generating code: {e}") from e
+            return f"print('Error generating code: {str(e)}')"
 
     async def execute_with_retry(self, nl_command: str, history: list, state: dict = {}) -> dict:
         """Execute code with retry logic for error handling"""
@@ -501,11 +517,11 @@ class CodeAgent(Runnable):
 
         configured_retries = state.get("executor_max_retries")
         if isinstance(configured_retries, int) and configured_retries > 0:
-            self.max_retries = 1
+            self.max_retries = configured_retries
         elif "analysis_mode" in state:
             mode = normalize_analysis_mode(state.get("analysis_mode"))
             depth = state.get("question_depth", "medium")
-            self.max_retries = min(1, executor_max_attempts(mode, depth))
+            self.max_retries = executor_max_attempts(mode, depth)
 
         # init history if missing
         history = state.setdefault("history", [])

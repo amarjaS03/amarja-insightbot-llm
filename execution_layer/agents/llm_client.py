@@ -18,6 +18,14 @@ _openai_client = None
 ENFORCED_MODEL = "gpt-5.4"
 
 
+def vision_image_mime_subtype(suffix: str) -> str:
+    """MIME subtype for data:image/<subtype>;base64 URLs (vision). Maps .jpg -> jpeg."""
+    s = (suffix or "").lower().lstrip(".")
+    if s == "jpg":
+        return "jpeg"
+    return s if s else "png"
+
+
 def initialize_client() -> None:
     """
     Initialize LLM provider client(s) from env vars.

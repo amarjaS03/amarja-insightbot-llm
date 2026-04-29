@@ -6,9 +6,14 @@ import re
 from pathlib import Path
 from typing import Dict, Any, List
 from pydantic import BaseModel
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from agents.llm_client import llm_call
 from langchain_core.runnables import Runnable
+
+try:
+    from agents.llm_client import ENFORCED_MODEL
+except ImportError:
+    from execution_layer.agents.llm_client import ENFORCED_MODEL
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -209,6 +214,8 @@ Response format (JSON):
 
 class DataAnalysisAgent(Runnable):
     def __init__(self):
+        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.model = (os.getenv("MODEL_NAME") or ENFORCED_MODEL).strip() or ENFORCED_MODEL
         self.output_dir = EXEC_BASE_DIR / "output_data"
         self._code_agent = None
 
@@ -233,29 +240,34 @@ class DataAnalysisAgent(Runnable):
             logger.info(f"Processing user query: {user_query}")
             prompt = _build_query_analysis_prompt(state.get("input_dir", "/app/execution_layer/input_data"))
             preloaded_df_vars = state.get("preloaded_df_vars", {})
-            messages = [
-                {"role": "system", "content": prompt},
-                {
-                    "role": "user",
-                    "content": (
-                        f"User query: {user_query}\n"
-                        f"Preloaded datasets (dataset -> dataframe var): {json.dumps(preloaded_df_vars, ensure_ascii=False)}\n"
-                        "Generate tasks that directly use the preloaded dataframe variables and avoid re-loading datasets from disk in each task.\n"
-                        "df variable naming must be df_dataset_name format."
-                    ),
-                },
-            ]
-            content_text, usage = await llm_call(
-                messages, json_response=True, max_output_tokens=1000, temperature=0.2
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"User query: {user_query}\n"
+                            f"Preloaded datasets (dataset -> dataframe var): {json.dumps(preloaded_df_vars, ensure_ascii=False)}\n"
+                            "Generate tasks that directly use the preloaded dataframe variables and avoid re-loading datasets from disk in each task.\n"
+                            "df variable naming must be df_dataset_name format."
+                        ),
+                    },
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.2,
+                max_tokens=1000
             )
-
-            if state.get("metrics") is not None:
-                state["metrics"]["prompt_tokens"] += usage["input_tokens"]
-                state["metrics"]["completion_tokens"] += usage["output_tokens"]
-                state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+            
+            # Update metrics in state
+            if state.get("metrics") is not None and getattr(response, "usage", None) is not None:
+                state["metrics"]["prompt_tokens"] += response.usage.prompt_tokens
+                state["metrics"]["completion_tokens"] += response.usage.completion_tokens
+                state["metrics"]["total_tokens"] += response.usage.total_tokens
                 state["metrics"]["successful_requests"] += 1
-
-            parsed = json.loads(content_text or "{}")
+            
+            content_text = response.choices[0].message.content
+            parsed = json.loads(content_text)
             return parsed
         except Exception as e:
             logger.error(f"Error analyzing user query: {e}")
@@ -387,15 +399,16 @@ class DataAnalysisAgent(Runnable):
                     "download_placeholder": placeholder,
                     "sample_table": {"headers": headers, "rows": rows}
                 })
-                html_output, usage_csv = await llm_call(
-                    [
+                resp = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
                         {"role": "system", "content": summary_system},
-                        {"role": "user", "content": summary_user},
+                        {"role": "user", "content": summary_user}
                     ],
-                    max_output_tokens=1200,
                     temperature=0.2,
+                    max_tokens=1200
                 )
-                html_output = (html_output or "").strip()
+                html_output = resp.choices[0].message.content.strip()
                 try:
                     for var_name, b64 in (state.get("blob_vars") or {}).items():
                         token = f"${{{var_name}}}"
@@ -423,10 +436,12 @@ class DataAnalysisAgent(Runnable):
                     html_output = self._inject_missing_value_note(html_output, has_missing)
                 except Exception:
                     pass
-                if state.get("metrics") is not None:
-                    state["metrics"]["prompt_tokens"] += usage_csv["input_tokens"]
-                    state["metrics"]["completion_tokens"] += usage_csv["output_tokens"]
-                    state["metrics"]["total_tokens"] += usage_csv["input_tokens"] + usage_csv["output_tokens"]
+                if state.get("metrics") is not None and getattr(resp, "usage", None) is not None:
+                    state["metrics"]["prompt_tokens"] += resp.usage.prompt_tokens
+                    state["metrics"]["completion_tokens"] += resp.usage.completion_tokens
+                    state["metrics"]["total_tokens"] += (
+                        resp.usage.prompt_tokens + resp.usage.completion_tokens
+                    )
                     state["metrics"]["successful_requests"] += 1
             except Exception as e:
                 html_output = f"<p>Saved file detected but preview failed: {str(e)}</p>"
@@ -471,15 +486,16 @@ class DataAnalysisAgent(Runnable):
                 "result_type": "small_text",
                 "printed_text": safe
             })
-            html_output, usage_small = await llm_call(
-                [
+            resp = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
                     {"role": "system", "content": summary_system},
-                    {"role": "user", "content": summary_user},
+                    {"role": "user", "content": summary_user}
                 ],
-                max_output_tokens=1200,
                 temperature=0.2,
+                max_tokens=1200
             )
-            html_output = (html_output or "").strip()
+            html_output = resp.choices[0].message.content.strip()
             # Sanitize HTML to ensure it's a fragment, not a full page
             html_output = self._sanitize_html_fragment(html_output)
             # Inject a deterministic note when missing values are present
@@ -487,10 +503,12 @@ class DataAnalysisAgent(Runnable):
                 html_output = self._inject_missing_value_note(html_output, has_missing_small)
             except Exception:
                 pass
-            if state.get("metrics") is not None:
-                state["metrics"]["prompt_tokens"] += usage_small["input_tokens"]
-                state["metrics"]["completion_tokens"] += usage_small["output_tokens"]
-                state["metrics"]["total_tokens"] += usage_small["input_tokens"] + usage_small["output_tokens"]
+            if state.get("metrics") is not None and getattr(resp, "usage", None) is not None:
+                state["metrics"]["prompt_tokens"] += resp.usage.prompt_tokens
+                state["metrics"]["completion_tokens"] += resp.usage.completion_tokens
+                state["metrics"]["total_tokens"] += (
+                    resp.usage.prompt_tokens + resp.usage.completion_tokens
+                )
                 state["metrics"]["successful_requests"] += 1
 
         # Persist - use job-specific output directory from state

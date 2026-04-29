@@ -9,19 +9,92 @@ from typing import List, Dict, Any
 from pathlib import Path
 import datetime as dt
 
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from agents.llm_client import llm_call
 from langchain_core.runnables import Runnable
 
 from bs4 import BeautifulSoup
 
 from agents.executor import CodeAgent
 from agents.token_manager import check_token_limit_internal, complete_job_gracefully, TokenLimitExceededException
+from agents.analysis_mode import DEFAULT_ANALYSIS_MODE
+from agents.llm_client import ENFORCED_MODEL, vision_image_mime_subtype
 from agents.perf_utils import log_resources
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _looks_like_raw_synthesis_json(s: str) -> bool:
+    t = (s or "").lstrip()
+    return bool(t) and t[0] == "{" and ("thinking_logs" in t or '"html_report"' in t)
+
+
+def _extract_html_report_fallback(raw: str) -> str | None:
+    """
+    Recover executive HTML when json.loads fails (invalid escapes, unescaped quotes
+    inside html_report, or truncation). Prefers the document after \"html_report\".
+    """
+    text = raw or ""
+    anchor = text.find('"html_report"')
+    search = text[anchor:] if anchor != -1 else text
+    m = re.search(r"(<!DOCTYPE\s+html[\s\S]*?</html\s*>)", search, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"(<html\b[\s\S]*?</html\s*>)", search, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"(<!DOCTYPE\s+html[\s\S]*)", search, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"(<html\b[\s\S]*)", search, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _fix_mangled_quote_attrs(html_src: str) -> str:
+    """Turn attr='\"value\"' (bad JSON-in-HTML) into attr=\"value\"."""
+    if not html_src:
+        return html_src
+    s = html_src
+    if '\\"' in s:
+        s = re.sub(r"(\w[-\w]*)='\\\"([^\\\"]*)\\\"'", r'\1="\2"', s)
+    s = s.replace("\\</div>", "</div>").replace("</\\div>", "</div>")
+    # Recovered snippets sometimes still contain literal backslash-n from JSON text
+    if "\\n" in s[:4000] and s.count("\\n") > s.count("\n"):
+        s = s.replace("\\n", "\n").replace("\\t", "\t")
+    return s
+
+
+def _repair_viewport_meta(html_src: str) -> str:
+    """Fix broken viewport tags when model split quotes incorrectly."""
+    try:
+        soup = BeautifulSoup(html_src, "html.parser")
+        head = soup.find("head")
+        if not head:
+            return html_src
+        for m in head.find_all("meta"):
+            if (m.get("name") or "").lower() == "viewport":
+                m["content"] = "width=device-width, initial-scale=1"
+                break
+        return str(soup)
+    except Exception:
+        return html_src
+
+
+def _ensure_doctype_html_wrapper(html_src: str) -> str:
+    ch = (html_src or "").strip()
+    if not ch:
+        return ch
+    if ch.lower().startswith("<!doctype"):
+        return html_src
+    if ch.lower().startswith("<html"):
+        return f"<!DOCTYPE html>\n{ch}"
+    if ch.startswith("<"):
+        return f"<!DOCTYPE html>\n<html lang=\"en\">\n{ch}\n</html>"
+    return html_src
 
 # Updated Vision Analysis Prompt for better business context
 VISION_ANALYSIS_PROMPT = """You are a senior management consultant responsible for analyzing data visualizations for executive presentations.
@@ -140,6 +213,11 @@ FINAL_SYNTHESIS_PROMPT = """You are creating a McKinsey-style executive report t
         "html_report": "complete HTML code with embedded CSS"
     }
 
+    CRITICAL — valid JSON: Inside the html_report STRING, every HTML attribute MUST use
+    SINGLE quotes only (e.g. <meta charset='utf-8'/>, <div class='report-wrap'>). Never put
+    raw double-quotes inside attribute values in html_report, or the JSON will be invalid and
+    the report will fail. Escape any double quote inside text content as \\" if needed.
+
     Do not mention McKinsey in the report.
     Make sure to include 4-6 detailed thinking_logs that show your actual reasoning process.
 
@@ -147,6 +225,8 @@ FINAL_SYNTHESIS_PROMPT = """You are creating a McKinsey-style executive report t
 
 class NarratorAgent(Runnable):
     def __init__(self, output_dir):
+        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.model = (os.getenv("MODEL_NAME") or ENFORCED_MODEL).strip() or ENFORCED_MODEL
         self.output_dir = output_dir or os.path.join('execution_layer', 'output_data')
         # Ensure narrator output directory exists
         self.narrator_dir = Path(self.output_dir) / "narrator"
@@ -249,6 +329,16 @@ class NarratorAgent(Runnable):
                     "technical_details": "",
                     "recommendations": ""
                 }
+            if Path(image_path).suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+                return {
+                    "path": image_path,
+                    "selection": "include",
+                    "reasoning": "Non-raster format; vision API not used.",
+                    "executive_summary": f"Artifact: {Path(image_path).name}",
+                    "business_implications": "",
+                    "technical_details": "",
+                    "recommendations": "",
+                }
             
             logger.info(f"Analyzing image for curation: {image_path}")
             # Read and encode image
@@ -295,27 +385,43 @@ class NarratorAgent(Runnable):
             
             print(f"📊 [NARRATOR_AGENT] {token_message}")
             
-            vision_messages = [
-                {"role": "system", "content": VISION_ANALYSIS_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": vision_msg},
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:image/{Path(image_path).suffix[1:]};base64,{base64_image}",
-                        },
-                    ],
-                },
-            ]
-            content, usage = await llm_call(vision_messages, max_output_tokens=800)
-
-            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
-            state["metrics"]["completion_tokens"] += usage["output_tokens"]
-            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+            response = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": VISION_ANALYSIS_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": vision_msg},
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:image/{vision_image_mime_subtype(Path(image_path).suffix)};base64,{base64_image}"
+                            }
+                        ]
+                    }
+                ],
+                max_output_tokens=800
+            )
+            
+            # Update metrics in state
+            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0) if hasattr(response, "usage") else 0
+            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0) if hasattr(response, "usage") else 0
+            state["metrics"]["total_tokens"] += (
+                (getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)) if hasattr(response, "usage") else 0
+            )
             state["metrics"]["successful_requests"] += 1
-            tokens_used = usage["input_tokens"] + usage["output_tokens"]
-            print(f"📊 [NARRATOR_AGENT] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
+
+            # Log token usage for this call
+            if hasattr(response, "usage") and response.usage:
+                tokens_used = getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+                print(f"📊 [NARRATOR_AGENT] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
+            
+            content = getattr(response, "output_text", None)
+            if not content:
+                try:
+                    content = response.output[0].content[0].text
+                except Exception:
+                    content = ""
             
             # Try to parse JSON response
             try:
@@ -422,44 +528,6 @@ class NarratorAgent(Runnable):
             return []
         return [str(p) for p in Path(output_dir).rglob("*") if p.is_file()]
 
-    @staticmethod
-    def _extract_html_report(content: str) -> str:
-        """Best-effort extraction of HTML report from LLM output."""
-        raw = (content or "").strip()
-        if not raw:
-            return ""
-
-        # Remove common fenced wrappers.
-        fenced = re.sub(r"^```(?:json|html)?\s*", "", raw)
-        fenced = re.sub(r"\s*```$", "", fenced).strip()
-
-        # 1) Try direct JSON payload.
-        try:
-            parsed = json.loads(fenced)
-            if isinstance(parsed, dict):
-                return str(parsed.get("html_report", "") or "").strip()
-        except Exception:
-            pass
-
-        # 2) Try extracting embedded JSON object.
-        obj_match = re.search(r"\{[\s\S]*\}", fenced)
-        if obj_match:
-            try:
-                parsed = json.loads(obj_match.group(0))
-                if isinstance(parsed, dict):
-                    return str(parsed.get("html_report", "") or "").strip()
-            except Exception:
-                pass
-
-        # 3) If already contains HTML, return from first HTML marker.
-        html_idx = fenced.lower().find("<!doctype html>")
-        if html_idx == -1:
-            html_idx = fenced.lower().find("<html")
-        if html_idx != -1:
-            return fenced[html_idx:].strip()
-
-        return fenced
-
     async def _draft_report_frame(self, state: dict, all_files: List[str]) -> Dict[str, Any]:
         """LLM call to draft narrative frame & choose up to 10 key files."""
         milestone_cb = state.get("milestone_callback", lambda *a, **k: None)
@@ -506,22 +574,35 @@ class NarratorAgent(Runnable):
             
             print(f"📊 [NARRATOR_AGENT] {token_message}")
             
-            messages = [
-                {"role": "system", "content": FRAME_PROMPT},
-                {"role": "user", "content": json.dumps(payload, indent=2)},
-            ]
-            content, usage = await llm_call(messages, json_response=True, max_output_tokens=2000)
-            if not content:
-                content = "{}"
+            _frame_cap = 1200 if state.get("narrator_verbosity") == "concise" else 1600
+            response = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": FRAME_PROMPT},
+                    {"role": "user", "content": json.dumps(payload, indent=2)}
+                ],
+                text={"format": {"type": "json_object"}},
+                max_output_tokens=_frame_cap,
+            )
 
-            if isinstance(state.get("metrics"), dict):
+            if hasattr(response, "usage") and isinstance(state.get("metrics"), dict):
                 m = state["metrics"]
-                m["prompt_tokens"] += usage["input_tokens"]
-                m["completion_tokens"] += usage["output_tokens"]
-                m["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+                m["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
+                m["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
+                m["total_tokens"] += getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
                 m["successful_requests"] += 1
-            tokens_used = usage["input_tokens"] + usage["output_tokens"]
-            print(f"📊 [NARRATOR_AGENT] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
+
+            # Log token usage for this call
+            if hasattr(response, "usage") and response.usage:
+                tokens_used = getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+                print(f"📊 [NARRATOR_AGENT] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
+
+            content = getattr(response, "output_text", None)
+            if not content:
+                try:
+                    content = response.output[0].content[0].text
+                except Exception:
+                    content = "{}"
             milestone_cb("Narrator: LLM report frame done", "narrator_frame_llm_done", {"dependency": "sequential", "is_llm_call": True})
             return json.loads(content)
         except Exception as e:
@@ -536,8 +617,23 @@ class NarratorAgent(Runnable):
 
         ext = p.suffix.lower()
         try:
-            if ext in {".png", ".jpg", ".jpeg", ".svg"}:
+            if ext in {".png", ".jpg", ".jpeg"}:
                 analysis = await self.analyze_image_with_vision(path, "Executive report", state)
+                print("="*300)
+                logger.info(f"Analysis: {path}")
+                logger.info(f"Analysis: {analysis}")
+                print("="*300)
+                return {"file": path, "type": "image", "analysis": analysis}
+            elif ext == ".svg":
+                analysis = {
+                    "path": path,
+                    "selection": "include",
+                    "reasoning": "SVG vector graphic; vision API skipped — describe from filename/context only.",
+                    "executive_summary": f"Vector chart file: {p.name}",
+                    "business_implications": "",
+                    "technical_details": "SVG format; use accompanying CSV or numeric outputs where available.",
+                    "recommendations": "",
+                }
                 print("="*300)
                 logger.info(f"Analysis: {path}")
                 logger.info(f"Analysis: {analysis}")
@@ -604,7 +700,7 @@ class NarratorAgent(Runnable):
         if not selected_files:
             return []
 
-        semaphore = asyncio.Semaphore(4)
+        semaphore = asyncio.Semaphore(6)
         milestone_cb = state.get("milestone_callback", lambda *a, **k: None)
 
         async def _analyze_one(fp: str) -> Dict[str, Any]:
@@ -628,7 +724,7 @@ class NarratorAgent(Runnable):
         context = {
             "original_query": state.get("original_query", ""),
             "current_date": dt.datetime.now().strftime("%Y-%m-%d"),
-            "analysis_mode": state.get("analysis_mode", "slim"),
+            "analysis_mode": state.get("analysis_mode", DEFAULT_ANALYSIS_MODE),
             "report_verbosity": state.get("narrator_verbosity", "full"),
             "frame_text": frame_text,
             "file_analyses": file_analyses,
@@ -655,40 +751,69 @@ class NarratorAgent(Runnable):
             
             print(f"📊 [NARRATOR_AGENT] {token_message}")
             
-            messages = [
-                {"role": "system", "content": FINAL_SYNTHESIS_PROMPT},
-                {"role": "user", "content": json.dumps(context, indent=2)},
-            ]
-            content, usage = await llm_call(messages, json_response=True, max_output_tokens=6000)
-            if not content:
-                content = "{}"
+            _html_cap = 5500 if state.get("narrator_verbosity") == "concise" else 9000
+            response = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": FINAL_SYNTHESIS_PROMPT},
+                    {"role": "user", "content": json.dumps(context, indent=2)}
+                ],
+                text={"format": {"type": "json_object"}},
+                max_output_tokens=_html_cap,
+            )
 
-            if isinstance(state.get("metrics"), dict):
+            if hasattr(response, "usage") and isinstance(state.get("metrics"), dict):
                 m = state["metrics"]
-                m["prompt_tokens"] += usage["input_tokens"]
-                m["completion_tokens"] += usage["output_tokens"]
-                m["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+                m["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
+                m["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
+                m["total_tokens"] += getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
                 m["successful_requests"] += 1
-            tokens_used = usage["input_tokens"] + usage["output_tokens"]
-            print(f"📊 [NARRATOR_AGENT] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
+
+            # Log token usage for this call
+            if hasattr(response, "usage") and response.usage:
+                tokens_used = getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+                print(f"📊 [NARRATOR_AGENT] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
+
+            content = getattr(response, "output_text", None)
+            if not content:
+                try:
+                    content = response.output[0].content[0].text
+                except Exception:
+                    content = "{}"
             milestone_cb("Narrator: LLM final HTML done", "narrator_final_llm_done", {"dependency": "sequential", "is_llm_call": True})
             
+            progress_callback = state.get("progress_callback", lambda *args, **kwargs: None)
+            thinking_logs: list = []
+            html_report = ""
+
             try:
                 result = json.loads(content)
-                
-                # Stream LLM thinking logs via progress_callback
-                progress_callback = state.get("progress_callback", lambda *args, **kwargs: None)
-                thinking_logs = result.get('thinking_logs', [])
-                
-                for i, log in enumerate(thinking_logs):
-                    progress_callback(f"🤖 Narrator LLM #{i+1}", log, "📖")
-                    # Small delay to make logs visible
-                    await asyncio.sleep(0.2)
-                
-                html_report = result.get("html_report", "")
-                return html_report.strip()
-            except json.JSONDecodeError:
-                return self._extract_html_report(content)
+                thinking_logs = result.get("thinking_logs") or []
+                html_report = (result.get("html_report") or "").strip()
+                if not html_report:
+                    html_report = (_extract_html_report_fallback(content) or "").strip()
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    "[Narrator] Final synthesis JSON parse failed (%s); recovering HTML from raw output",
+                    e,
+                )
+                thinking_logs = []
+                recovered = _extract_html_report_fallback(content)
+                html_report = (recovered or "").strip()
+
+            for i, log in enumerate(thinking_logs):
+                progress_callback(f"🤖 Narrator LLM #{i+1}", log, "📖")
+                await asyncio.sleep(0.03)
+
+            if not html_report:
+                logger.error("[Narrator] No html_report after parse/recovery")
+                return self.generate_error_report(
+                    "Final synthesis returned no usable HTML (invalid or truncated JSON). "
+                    "Retry the job; if this persists, increase tokens or simplify the prompt context."
+                )
+
+            out = _fix_mangled_quote_attrs(html_report)
+            return _repair_viewport_meta(out)
         except Exception as e:
             logger.error(f"Error generating final HTML: {e}")
             return self.generate_error_report(str(e))
@@ -750,21 +875,20 @@ class NarratorAgent(Runnable):
                     clean_html = matches[0].strip()
                 else:
                     clean_html = html_report.replace("```html", "").replace("```", "").strip()
-            
-            clean_html = clean_html.strip()
-            if clean_html:
-                # Keep at most one doctype, anchored to the top.
-                first_doctype = clean_html.lower().find("<!doctype html>")
-                if first_doctype > 0:
-                    clean_html = clean_html[first_doctype:]
-                clean_html = re.sub(r"(?is)^\s*(?:<!doctype html>\s*)+", "<!DOCTYPE html>\n", clean_html).strip()
 
-            # Ensure minimal HTML structure if needed.
-            if "<html" in clean_html.lower():
-                if not clean_html.lower().startswith("<!doctype html>"):
-                    clean_html = f"<!DOCTYPE html>\n{clean_html}"
-            else:
-                clean_html = f"<!DOCTYPE html>\n<html><body>{clean_html}</body></html>"
+            clean_html = _repair_viewport_meta(_fix_mangled_quote_attrs(clean_html))
+            if _looks_like_raw_synthesis_json(clean_html):
+                recovered = _extract_html_report_fallback(clean_html)
+                if recovered:
+                    clean_html = _fix_mangled_quote_attrs(recovered)
+                else:
+                    logger.error("[Narrator] Post-process still looks like raw JSON; refusing to wrap as HTML")
+                    clean_html = self.generate_error_report(
+                        "Report generation returned JSON instead of HTML after cleanup."
+                    )
+
+            if not _looks_like_raw_synthesis_json(clean_html):
+                clean_html = _ensure_doctype_html_wrapper(clean_html)
             milestone_cb("Narrator: Post-processing HTML", "narrator_final_html_complete", {"dependency": "sequential", "is_llm_call": False})
 
              # Convert images to base64

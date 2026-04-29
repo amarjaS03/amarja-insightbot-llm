@@ -6,8 +6,8 @@ import re
 import base64
 from typing import List, Dict, Any
 from pathlib import Path
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from agents.llm_client import llm_call
 from langchain_core.runnables import Runnable
 
 from agents.executor import CodeAgent
@@ -15,9 +15,11 @@ from agents.analysis_mode import (
     normalize_analysis_mode,
     eda_tasks_per_cycle,
     eda_cycle_count,
+    eda_min_cycles,
     skip_image_analysis,
 )
 from agents.token_manager import check_token_limit_internal, TokenLimitExceededException
+from agents.llm_client import ENFORCED_MODEL, vision_image_mime_subtype
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -137,6 +139,8 @@ Keep the summary concise but informative. Structure with clear sections."""
 
 class EDAAgent(Runnable):
     def __init__(self, output_dir):
+        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.model = (os.getenv("MODEL_NAME") or ENFORCED_MODEL).strip() or ENFORCED_MODEL
         self.state = None
         self.output_dir = output_dir
         self.max_iterations = 3  # Dynamically overridden by analysis mode
@@ -209,25 +213,37 @@ Be concise but thorough in your analysis.
                 state["error"] = f"🚫 PROCESS STOPPED: {token_message}"
                 raise TokenLimitExceededException(token_message)
 
-            messages = [
-                {"role": "system", "content": VISION_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": vision_msg},
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:image/{img_path.suffix[1:]};base64,{base64_image}",
-                        },
-                    ],
-                },
-            ]
-            analysis, usage = await llm_call(messages, max_output_tokens=600)
+            response = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": vision_msg},
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:image/{vision_image_mime_subtype(img_path.suffix)};base64,{base64_image}"
+                            }
+                        ]
+                    }
+                ],
+                max_output_tokens=600
+            )
 
-            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
-            state["metrics"]["completion_tokens"] += usage["output_tokens"]
-            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
+            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
+            state["metrics"]["total_tokens"] += (
+                getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+            )
             state["metrics"]["successful_requests"] += 1
+
+            analysis = getattr(response, "output_text", None)
+            if not analysis:
+                try:
+                    analysis = response.output[0].content[0].text
+                except Exception:
+                    analysis = ""
 
             milestone_cb = state.get("milestone_callback", lambda *a, **k: None)
             milestone_cb(
@@ -247,7 +263,8 @@ Be concise but thorough in your analysis.
         # Ensure we have a Path object so .exists() and .glob() work correctly
         # from pathlib import Path  # local import to avoid any missing import issues in other contexts
         eda_output_dir = Path(self.output_dir)
-        image_extensions = ['.png', '.jpg', '.jpeg', '.svg', '.pdf']
+        # Vision API accepts raster images only (skip svg/pdf here).
+        image_extensions = [".png", ".jpg", ".jpeg"]
         
         found_images = []
         if eda_output_dir.exists():
@@ -255,7 +272,7 @@ Be concise but thorough in your analysis.
                 found_images.extend(list(eda_output_dir.glob(f"*{ext}")))
         
         # Remove duplicates
-        found_images = list(set(found_images))
+        found_images = list(set(found_images))[:EDA_MAX_IMAGES]
         
         if not found_images:
             logger.info("No images found for vision analysis")
@@ -263,7 +280,7 @@ Be concise but thorough in your analysis.
         
         logger.info(f"Found {len(found_images)} images for vision analysis")
         
-        semaphore = asyncio.Semaphore(3)
+        semaphore = asyncio.Semaphore(4)
 
         async def _with_limit(path: Path):
             async with semaphore:
@@ -328,19 +345,30 @@ Be concise but thorough in your analysis.
     """
 
         try:
-            messages = [
-                {"role": "system", "content": EDA_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ]
-            content, usage = await llm_call(messages, json_response=True, max_output_tokens=1000)
-            if not content:
-                content = "{}"
+            response = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": EDA_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg}
+                ],
+                text={"format": {"type": "json_object"}},
+                max_output_tokens=850,
+            )
 
-            # Update metrics in state
-            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
-            state["metrics"]["completion_tokens"] += usage["output_tokens"]
-            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+            # Update metrics in state (existing functionality - keep as is)
+            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
+            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
+            state["metrics"]["total_tokens"] += (
+                getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+            )
             state["metrics"]["successful_requests"] += 1
+
+            content = getattr(response, "output_text", None)
+            if not content:
+                try:
+                    content = response.output[0].content[0].text
+                except Exception:
+                    content = "{}"
 
             # Robust JSON parsing
             result = self._safe_json(content, self._fallback_plan(user_command))
@@ -357,7 +385,7 @@ Be concise but thorough in your analysis.
             for i, log in enumerate(thinking_logs):
                 progress_callback(f"🤖 EDA LLM #{i+1}", log, "📊")
                 # Small delay to make logs visible
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.03)
             
             return result
                 
@@ -477,19 +505,25 @@ Is this analysis sufficient for the original request? Return valid JSON only.
 """
 
         try:
-            messages = [
-                {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
-                {"role": "user", "content": analysis_msg},
-            ]
-            content, usage = await llm_call(messages, json_response=True, max_output_tokens=500)
-            content = content or ""
+            response = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+                    {"role": "user", "content": analysis_msg}
+                ],
+                text={"format": {"type": "json_object"}},
+                max_output_tokens=500
+            )
 
-            # Update metrics in state
-            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
-            state["metrics"]["completion_tokens"] += usage["output_tokens"]
-            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+            # Update metrics in state (existing functionality - keep as is)
+            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
+            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
+            state["metrics"]["total_tokens"] += (
+                getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+            )
             state["metrics"]["successful_requests"] += 1
 
+            content = getattr(response, "output_text", "") or ""
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
 
             if json_match:
@@ -526,18 +560,30 @@ Mode instruction: {"Keep it short and meaningful, focus on high-level insights a
 """
 
         try:
-            messages = [
-                {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
-                {"role": "user", "content": synthesis_input},
-            ]
-            content, usage = await llm_call(messages, max_output_tokens=1000)
+            _syn_cap = 650 if analysis_mode == "slim" else 900
+            response = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
+                    {"role": "user", "content": synthesis_input},
+                ],
+                max_output_tokens=_syn_cap,
+            )
 
-            # Update metrics in state
-            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
-            state["metrics"]["completion_tokens"] += usage["output_tokens"]
-            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+            # Update metrics in state (existing functionality - keep as is)
+            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
+            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
+            state["metrics"]["total_tokens"] += (
+                getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+            )
             state["metrics"]["successful_requests"] += 1
 
+            content = getattr(response, "output_text", None)
+            if not content:
+                try:
+                    content = response.output[0].content[0].text
+                except Exception:
+                    content = ""
             milestone_cb("EDA: LLM synthesis done", "eda_synthesis_llm_done", {"dependency": "sequential", "is_llm_call": True})
             return content
             
@@ -630,6 +676,8 @@ Mode instruction: {"Keep it short and meaningful, focus on high-level insights a
         analysis_mode = normalize_analysis_mode(state.get("analysis_mode"))
         question_depth = state.get("question_depth", "medium")
         self.max_iterations = eda_cycle_count(analysis_mode, question_depth)
+        self.min_iterations = eda_min_cycles(analysis_mode, question_depth)
+        logger.info(f"[EDA] analysis_mode={analysis_mode}, question_depth={question_depth}, max_iterations={self.max_iterations}, min_iterations={self.min_iterations}")
 
         # Initialize required state keys
         state.setdefault("eda_outputs", [])
@@ -652,19 +700,17 @@ Mode instruction: {"Keep it short and meaningful, focus on high-level insights a
                 iteration += 1
                 logger.info(f"EDA Iteration {iteration}")
 
-                # Check output limits before running tasks
+                # Check output limits before running tasks (only hard-stop after min cycles met)
                 img_count, file_count = self._count_eda_outputs(state.get("output_dir", self.output_dir))
                 if img_count >= EDA_MAX_IMAGES or file_count >= EDA_MAX_FILES:
-                    logger.info(f"EDA output limits reached ({img_count} images, {file_count} files). Skipping further tasks.")
-                    break
+                    if iteration > self.min_iterations:
+                        logger.info(f"EDA output limits reached ({img_count} images, {file_count} files) and min cycles met. Stopping.")
+                        break
+                    else:
+                        logger.info(f"EDA output limits reached ({img_count} images, {file_count} files) but min cycles not met ({iteration}/{self.min_iterations}). Continuing with text-only tasks.")
 
                 # Step 2: Execute current tasks
                 for task in current_tasks:
-                    img_count, file_count = self._count_eda_outputs(state.get("output_dir", self.output_dir))
-                    if img_count >= EDA_MAX_IMAGES or file_count >= EDA_MAX_FILES:
-                        logger.info(f"EDA limits reached. Skipping remaining tasks.")
-                        break
-
                     logger.info(f"Executing: {task['description']}")
 
                     task_result = await self.execute_task(task, state)
@@ -678,12 +724,31 @@ Mode instruction: {"Keep it short and meaningful, focus on high-level insights a
                     logger.info("Slim mode: single EDA cycle complete")
                     break
 
+                # For deep mode, force minimum cycles before allowing early exit
+                if iteration < self.min_iterations:
+                    logger.info(f"[EDA] Cycle {iteration}/{self.max_iterations}: below min_iterations={self.min_iterations}, skipping completeness check and continuing")
+                    # Plan additional tasks for the next cycle (instead of checking completeness)
+                    completeness = await self.analyze_completeness(state["eda_outputs"], original_request, state)
+                    milestone_cb("EDA: Completeness analyzed", "eda_completeness_analyzed", {"dependency": "sequential", "is_llm_call": True})
+                    # Use suggested tasks if any, otherwise re-plan
+                    additional = completeness.get("additional_tasks", [])
+                    if additional:
+                        current_tasks = self._normalize_cycle_tasks(additional, state, cycle_number=iteration + 1)
+                    else:
+                        # Re-plan with broader scope since LLM didn't suggest more
+                        replan = await self.plan_initial_tasks(original_request, state["eda_outputs"], state)
+                        current_tasks = self._normalize_cycle_tasks(replan.get("tasks", []), state, cycle_number=iteration + 1)
+                    max_id = max([len(state["eda_outputs"])], default=0)
+                    for i, task in enumerate(current_tasks):
+                        task["task_id"] = max_id + i + 1
+                    continue
+
                 logger.info("Analyzing analysis completeness...")
                 completeness = await self.analyze_completeness(state["eda_outputs"], original_request, state)
                 milestone_cb("EDA: Completeness analyzed", "eda_completeness_analyzed", {"dependency": "sequential", "is_llm_call": True})
                 
                 if completeness.get("sufficient", True) or not completeness.get("additional_tasks"):
-                    logger.info(f"Analysis sufficient: {completeness.get('reasoning', 'Complete')}")
+                    logger.info(f"Analysis sufficient after {iteration} cycles: {completeness.get('reasoning', 'Complete')}")
                     break
 
                 # Skip additional tasks if at output limits

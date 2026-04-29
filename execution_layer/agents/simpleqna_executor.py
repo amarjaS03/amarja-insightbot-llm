@@ -12,13 +12,13 @@ from dotenv import load_dotenv
 from langchain_core.runnables import Runnable
 
 from execution_layer.agents.coding_tool import JupyterExecutionTool
+from execution_layer.agents.llm_client import ENFORCED_MODEL
 
 # load .env
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-ENFORCED_MODEL = "gpt-5.4"
 
 
 class CancelledException(Exception):
@@ -217,7 +217,8 @@ class CodeAgent(Runnable):
     def __init__(self):
         # spin up a persistent Jupyter kernel
         self.executor = JupyterExecutionTool()
-        self.max_retries = 1
+        self.max_retries = 3
+        self.model = (os.getenv("MODEL_NAME") or ENFORCED_MODEL).strip() or ENFORCED_MODEL
         self._preloaded_key = None
         self._preloaded_vars: Dict[str, str] = {}
 
@@ -283,42 +284,33 @@ class CodeAgent(Runnable):
         - Never use relative 'input_data' or 'output_data' paths.
         """
         
-        model_name = (os.getenv("MODEL_NAME", ENFORCED_MODEL) or ENFORCED_MODEL).strip()
-        if model_name != ENFORCED_MODEL:
-            raise RuntimeError(
-                f"SimpleQnA strict mode requires MODEL_NAME='{ENFORCED_MODEL}', got '{model_name}'."
-            )
-
         client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         loop = asyncio.get_event_loop()
+        model = self.model
         
         try:
             system_prompt = _build_system_prompt(state.get("input_dir", "/app/execution_layer/input_data"))
             resp = await loop.run_in_executor(
                 None,
-                lambda: client.responses.create(
-                    model=model_name,
-                    input=[
+                lambda: client.chat.completions.create(
+                    model=model,
+                    messages=[
                         {"role": "developer", "content": system_prompt},
-                        {"role": "user", "content": user_msg},
+                        {"role": "user", "content": user_msg}
                     ],
                     temperature=0.1,
-                    max_output_tokens=2000
+                    max_tokens=2000
                 )
             )
             
             # Update metrics in state if available
             if state and "metrics" in state:
-                input_tokens = getattr(resp.usage, "input_tokens", 0) if getattr(resp, "usage", None) else 0
-                output_tokens = getattr(resp.usage, "output_tokens", 0) if getattr(resp, "usage", None) else 0
-                state["metrics"]["prompt_tokens"] += input_tokens
-                state["metrics"]["completion_tokens"] += output_tokens
-                state["metrics"]["total_tokens"] += (input_tokens + output_tokens)
+                state["metrics"]["prompt_tokens"] += resp.usage.prompt_tokens
+                state["metrics"]["completion_tokens"] += resp.usage.completion_tokens
+                state["metrics"]["total_tokens"] += (resp.usage.prompt_tokens + resp.usage.completion_tokens)
                 state["metrics"]["successful_requests"] += 1
             
-            code = (getattr(resp, "output_text", "") or "").strip()
-            if not code:
-                raise RuntimeError("Empty LLM code generation response from Responses API")
+            code = resp.choices[0].message.content
             
             # Clean up code formatting
             if code.startswith("```python"):
@@ -333,7 +325,11 @@ class CodeAgent(Runnable):
             
         except Exception as e:
             logger.error(f"Error generating code: {e}")
-            raise RuntimeError(f"Error generating code: {e}") from e
+            # Check if it's an API-specific error and provide helpful information
+            if "api" in str(e).lower() or "openai" in str(e).lower():
+                return f"print('API Error: Please check your OpenAI API key and model access. Error: {str(e)}')"
+            else:
+                return f"print('Error generating code: {str(e)}')"
 
     async def execute_with_retry(self, nl_command: str, history: list, state: dict = None) -> dict:
         """Execute code with retry logic for error handling"""

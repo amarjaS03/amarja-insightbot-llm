@@ -7,8 +7,8 @@ import base64
 import mimetypes
 from typing import Dict, Any, List
 from pathlib import Path
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from agents.llm_client import llm_call
 from langchain_core.runnables import Runnable
 from bs4 import BeautifulSoup
 
@@ -23,6 +23,7 @@ from agents.analysis_mode import (
     skip_hypothesis,
 )
 from agents.token_manager import check_token_limit_internal, complete_job_gracefully, TokenLimitExceededException
+from agents.llm_client import ENFORCED_MODEL
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -226,6 +227,8 @@ CRITICAL RULES FOR RELEVANCY CHECK:
 
 class DataAnalysisAgent(Runnable):
     def __init__(self, output_dir):
+        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.model = (os.getenv("MODEL_NAME") or ENFORCED_MODEL).strip() or ENFORCED_MODEL
         self.output_dir = output_dir
         print("output_dir in DataAnalysisAgent", self.output_dir)
 
@@ -260,22 +263,35 @@ class DataAnalysisAgent(Runnable):
             
             print(f"📊 [DATA_ANALYSIS_AGENT] {token_message}")
             
-            messages = [
-                {"role": "system", "content": query_analysis_prompt},
-                {"role": "user", "content": f"User query: {user_query}"},
-            ]
-            content, usage = await llm_call(messages, json_response=True, max_output_tokens=1500)
-            if not content:
-                content = "{}"
-
+            response = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": query_analysis_prompt},
+                    {"role": "user", "content": f"User query: {user_query}"}
+                ],
+                text={"format": {"type": "json_object"}},
+                max_output_tokens=1100,
+            )
+            
             # Update metrics in state
-            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
-            state["metrics"]["completion_tokens"] += usage["output_tokens"]
-            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
+            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
+            state["metrics"]["total_tokens"] += (
+                getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+            )
             state["metrics"]["successful_requests"] += 1
-
-            tokens_used = usage["input_tokens"] + usage["output_tokens"]
-            print(f"📊 [DATA_ANALYSIS_AGENT] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
+            
+            # Log token usage for this call
+            if hasattr(response, "usage") and response.usage:
+                tokens_used = getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+                print(f"📊 [DATA_ANALYSIS_AGENT] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
+            
+            content = getattr(response, "output_text", None)
+            if not content:
+                try:
+                    content = response.output[0].content[0].text
+                except Exception:
+                    content = "{}"
             
             result = json.loads(content)
             
@@ -286,7 +302,7 @@ class DataAnalysisAgent(Runnable):
             for i, log in enumerate(thinking_logs):
                 progress_callback(f"🤖 LLM Thinking #{i+1}", log, "🧠")
                 # Small delay to make logs visible
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.03)
             
             # Check if query is supportable
             is_supportable = result.get('is_supportable', True)  # Default to True for backward compatibility
@@ -306,7 +322,7 @@ class DataAnalysisAgent(Runnable):
             return result
         except Exception as e:
             logger.error(f"Error analyzing user query: {e}")
-            raise RuntimeError(f"Query analysis failed: {e}") from e
+            return self._fallback_query_analysis(user_query)
 
     def _fallback_query_analysis(self, user_query: str) -> Dict[str, Any]:
         """Fallback analysis if JSON parsing fails"""
@@ -369,10 +385,12 @@ class DataAnalysisAgent(Runnable):
             
             query_analysis = await self.analyze_user_query(original_query, state)
             state["query_analysis"] = query_analysis
-            question_depth = infer_question_depth(original_query, query_analysis)
+            # Use pre-set question_depth (e.g. from /analyze_job) if available; otherwise infer from query
+            question_depth = state.get("question_depth") or infer_question_depth(original_query, query_analysis)
             state["question_depth"] = question_depth
             state["executor_max_retries"] = executor_max_attempts(analysis_mode, question_depth)
             state["narrator_verbosity"] = narrator_verbosity(analysis_mode)
+            logger.info(f"[PIPELINE] analysis_mode={analysis_mode}, question_depth={question_depth}, executor_max_retries={state['executor_max_retries']}, narrator_verbosity={state['narrator_verbosity']}")
             milestone_cb("Analysis: Query analysis", "analysis_query_complete", {"dependency": "sequential", "is_llm_call": True})
             logger.info(f"Query analysis result: {query_analysis}")
             logger.info("Query analysis complete")
@@ -399,9 +417,8 @@ class DataAnalysisAgent(Runnable):
             progress_callback("EDA Started", "Starting exploratory data analysis", "📊")
             
             eda_agent = EDAAgent(output_dir=self.output_dir)
-            # EDA reads state["query_analysis"] separately; keep command as the user query only.
-            # Embedding the full query_analysis dict here bloated every planner/code-gen prompt (slow + costly).
-            state["command"] = original_query
+            # Set EDA analysis type and run on the same shared state
+            state["command"] = f"Perform {query_analysis} analysis: {original_query}"
             
             progress_callback("EDA In Progress", "Analyzing data patterns and distributions", "🔍")
             state = await eda_agent.ainvoke(state, config, **kwargs)
@@ -509,24 +526,6 @@ class DataAnalysisAgent(Runnable):
                     logger.info("Saved base64 analysis report (analysis_report.html)")
                 except Exception as e:
                     logger.warning(f"Error saving final analysis report: {e}")
-
-                # Deterministic HTML from disk artifacts (e.g. pickup_location_*.csv) when present;
-                # uses relative image paths — skip when pseudonymized (keep portable base64 report).
-                if not session_pseudonymized:
-                    try:
-                        from agents.report_builder import try_rebuild_data_driven_report
-
-                        rb = try_rebuild_data_driven_report(self.output_dir)
-                        if rb and rb.get("status") == "success":
-                            rebuilt = (Path(self.output_dir) / "analysis_report.html").read_text(
-                                encoding="utf-8", errors="ignore"
-                            )
-                            state["final_html_report"] = rebuilt
-                            rp = state.get("report_processing") if isinstance(state.get("report_processing"), dict) else {}
-                            state["report_processing"] = {**rp, "data_driven_rebuild": rb}
-                            logger.info("Overwrote analysis_report.html with data-driven report: %s", rb.get("checks"))
-                    except Exception as e:
-                        logger.debug("Data-driven report rebuild skipped: %s", e)
             
             milestone_cb("Analysis: Report saved", "analysis_report_complete", {"dependency": "sequential", "is_llm_call": False})
             # Step 5: Final report generation

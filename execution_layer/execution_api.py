@@ -1,3 +1,6 @@
+# it receives orders (HTTP requests), dispatches workers (AI agents), and ships finished products (HTML reports).
+
+
 from flask import Flask, request, jsonify
 import asyncio
 from flask_cors import CORS
@@ -14,20 +17,26 @@ import shutil
 import queue
 from pathlib import Path
 import re
-import firebase_admin
-from firebase_admin import firestore as firebase_firestore
+# Firebase / Firestore - optional; not needed in local mode
+try:
+    import firebase_admin
+    from firebase_admin import firestore as firebase_firestore
+    _FIREBASE_AVAILABLE = True
+except ImportError:
+    firebase_admin = None
+    firebase_firestore = None
+    _FIREBASE_AVAILABLE = False
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from execution_layer.runtime_io import ensure_terminal_friendly_io
-
 # Import analysis components
 from execution_layer.agents.data_analysis_agent import DataAnalysisAgent
-from execution_layer.agents.llm_client import initialize_client
 from typing import TypedDict, Dict, Any
 
 from execution_layer.image_utils.image_master import write_image_master_atomic, load_image_master
+from execution_layer.agents.llm_client import ENFORCED_MODEL
+from execution_layer.agents.analysis_mode import DEFAULT_ANALYSIS_MODE, normalize_analysis_mode
 
 # Import Simple QnA agent (lazy import to avoid startup errors)
 try:
@@ -42,9 +51,6 @@ class MetricsState(TypedDict):
     completion_tokens: int
     successful_requests: int
 
-
-ENFORCED_MODEL_NAME = "gpt-5.4"
-
 class ProgressEvent:
     def __init__(self, job_id: str, stage: str, message: str, percentage: int, emoji: str = ""):
         self.job_id = job_id
@@ -52,8 +58,8 @@ class ProgressEvent:
         self.message = message
         self.percentage = percentage
         self.emoji = emoji
-        self.timestamp = time.time()
-        self.iso_timestamp = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())
+        self.timestamp = time.time() #Stores current time in Unix timestamp format
+        self.iso_timestamp = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime()) #Stores time in ISO format (readable string like 2026-04-20T10:30:00)
 
     def to_dict(self):
         return {
@@ -123,65 +129,82 @@ cancellation_manager = CancellationManager()
 
 class ExecutionApi:
     def __init__(self):
-        ensure_terminal_friendly_io()
         self.app = Flask(__name__)
         CORS(self.app)
         
-        # SocketIO client to connect to API layer for progress streaming
-        # This creates a client connection (not server) to avoid conflicts
-        self.sio_client = socketio.SimpleClient()
-        self.api_layer_connected = False
-        self._sio_lock = threading.Lock()
-
-        # Cloud Run / GCS FUSE configuration (REQUIRED for v2 - Cloud Run only)
-        # - cloud_run_service.yaml sets: GCS_BUCKET, DATA_DIR, api_layer_url
+        # Read mode first so all guards below can use it
         self.gcs_bucket = (os.getenv("GCS_BUCKET") or "").strip()
         self.data_dir = (os.getenv("DATA_DIR") or "").strip()
-        
-        # Validate Cloud Run configuration
-        if not self.data_dir:
-            raise RuntimeError("DATA_DIR environment variable is required (Cloud Run only mode). This execution layer must run in Cloud Run with GCS FUSE mount.")
-        if not self.gcs_bucket:
-            raise RuntimeError("GCS_BUCKET environment variable is required (Cloud Run only mode).")
-        
-        # API layer URL for Socket.IO progress streaming (required for progress updates)
-        # Read API layer URL from environment (set by Cloud Run service YAML)
-        # Check both uppercase and lowercase variants
+        self.local_mode = os.getenv("LOCAL_MODE", "false").lower() == "true"
+        self.enable_socket = os.getenv("ENABLE_SOCKET", "false").lower() == "true"
+        self.api_layer_connected = False
         self.api_layer_url = (os.getenv("API_LAYER_URL") or os.getenv("api_layer_url") or "").strip().rstrip("/")
-        if self.api_layer_url:
+        print("LOCAL_MODE:", self.local_mode)
+        print("API_LAYER_URL:", self.api_layer_url)
+        print("SOCKET CONNECTED:", self.api_layer_connected)
+
+        # Validate configuration
+        if self.local_mode:
+            print("[EXECUTION LAYER] ⚠️ Running in LOCAL MODE.")
+            # Default to execution_layer dir if DATA_DIR is not set
+            if not self.data_dir:
+                self.data_dir = os.path.dirname(os.path.abspath(__file__))
+        else:
+            # Validate Cloud Run configuration
+            if not self.data_dir:
+                raise RuntimeError("DATA_DIR environment variable is required (Cloud Run only mode). This execution layer must run in Cloud Run with GCS FUSE mount.")
+            if not self.gcs_bucket:
+                raise RuntimeError("GCS_BUCKET environment variable is required (Cloud Run only mode).")
+
+        # SocketIO client - only instantiated in Cloud Run mode for progress streaming
+        if not self.local_mode or self.enable_socket:
+            self.sio_client = socketio.SimpleClient()
+        else:
+            self.sio_client = None
+            #self.sio_client = socketio.SimpleClient()
+        # API layer URL for Socket.IO progress streaming
+        if self.local_mode and self.enable_socket:
+            print("[EXECUTION LAYER] ✅ Local mode: Socket.IO streaming ENABLED (ENABLE_SOCKET=true)")
+            if self.api_layer_url:
+                print(f"[EXECUTION LAYER] ✅ API_LAYER_URL configured: {self.api_layer_url}")
+            else:
+                print("[EXECUTION LAYER] ⚠️ API_LAYER_URL not set — set it to your API layer base URL for Socket.IO")
+        elif self.local_mode:
+            print("[EXECUTION LAYER] ℹ️  Local mode: Socket.IO streaming DISABLED (set ENABLE_SOCKET=true to enable)")
+        elif self.api_layer_url:
             print(f"[EXECUTION LAYER] ✅ API_LAYER_URL configured: {self.api_layer_url}")
         else:
             print("[EXECUTION LAYER] ⚠️ Warning: API_LAYER_URL not set - progress streaming will be disabled")
         
-        # Cancellation manager for stop functionality
+        # Cancellation manager to stop jobs functionality
         self.cancellation_manager = cancellation_manager
                 
-        # Cloud Run: Use GCS FUSE mounted directory for locks (inside DATA_DIR)
-        # Create a writable locks directory inside the mounted data directory
+        # Use DATA_DIR for locks in Cloud Run; a local .locks subdir in local mode
         self.locks_dir = os.path.join(self.data_dir, '.locks')
         try:
             os.makedirs(self.locks_dir, exist_ok=True)
         except Exception as e:
-            # Fallback to /tmp if DATA_DIR/.locks is not writable (shouldn't happen in Cloud Run)
-            print(f"[EXECUTION LAYER] ⚠️ Could not create locks dir in DATA_DIR, using /tmp: {e}")
-            self.locks_dir = '/tmp'
+            fallback = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.locks') if self.local_mode else '/tmp'
+            print(f"[EXECUTION LAYER] ⚠️ Could not create locks dir, using fallback {fallback}: {e}")
+            self.locks_dir = fallback
             os.makedirs(self.locks_dir, exist_ok=True)
         
-        # File-based run lock path (per Cloud Run instance) - use writable locks dir
+        # File-based run lock path
         self.run_lock_path = os.path.join(self.locks_dir, '.analysis_running.lock')
         # Cache job_ids that are invalid for milestone API (prevents repetitive 404 spam).
         self._milestone_invalid_jobs = set()
+        
+        # Local mode: set a default output_dir for the legacy /analyze endpoint
+        if self.local_mode:
+            self.output_dir = os.path.join(self.data_dir, 'output_data')
+            os.makedirs(self.output_dir, exist_ok=True)
+        else:
+            self.output_dir = os.path.join(self.data_dir, 'output_data')
         
         # Progress tracking for jobs - restored streaming capability
         self.active_jobs = set()
         self.progress_lock = threading.Lock()
         
-        # Initialize LLM client singleton (routes based on MODEL_NAME / LLM_PROVIDER env vars)
-        try:
-            initialize_client()
-        except Exception as e:
-            print(f"[EXECUTION LAYER] ⚠️ Warning: Could not initialize LLM client: {e}")
-
         # Register routes 
         self.register_routes()
         # Reuse a single SimpleQnA agent instance to preserve warm caches/kernels.
@@ -192,6 +215,7 @@ class ExecutionApi:
                 self.simpleqna_agent = SimpleQnaDataAnalysisAgent()
             except Exception as e:
                 print(f"⚠️ Warning: Could not initialize shared SimpleQnA agent: {e}")
+                
 
     @staticmethod
     def _sanitize_email_for_storage(email: str) -> str:
@@ -199,16 +223,6 @@ class ExecutionApi:
         if not email:
             return "anonymous"
         return re.sub(r"[^a-zA-Z0-9]+", "_", email.lower()).strip("_")
-
-    @staticmethod
-    def _resolve_model_name(requested_model: str | None) -> str:
-        """Strictly enforce GPT-5.4 across execution endpoints."""
-        model = (requested_model or ENFORCED_MODEL_NAME).strip()
-        if model != ENFORCED_MODEL_NAME:
-            raise ValueError(
-                f"Strict model policy violation: expected '{ENFORCED_MODEL_NAME}', got '{model}'"
-            )
-        return model
 
     def _get_data_root(self) -> str:
         """Return Cloud Run mounted data dir (always required in v2)."""
@@ -236,6 +250,16 @@ class ExecutionApi:
         Note: v2 execution layer is Cloud Run only - no local/dev fallbacks.
         """
         data_root = self._get_data_root()
+        
+        if getattr(self, 'local_mode', False):
+            # In local mode, bypass the user/session hierarchy and use local input_data/output_data
+            input_dir = os.path.join(data_root, "input_data")
+            if job_id:
+                output_dir = os.path.join(data_root, "output_data", job_id)
+            else:
+                output_dir = os.path.join(data_root, "output_data")
+            return input_dir, output_dir
+
         safe_user = (user_email_sanitized or "").strip() or self._sanitize_email_for_storage(user_email or "")
 
         safe_session = (session_id or "").strip()
@@ -250,9 +274,43 @@ class ExecutionApi:
             output_dir = os.path.join(data_root, safe_user, safe_session, "output_data")
         return input_dir, output_dir
 
+    def _effective_job_input_dir(self, data: dict, resolved_input_dir: str) -> str:
+        """
+        Choose the directory agents use to read domain_directory.json and datasets.
+
+        - If the client sends input_dir and it exists, use it (Cloud Run / local uploads).
+        - Else in LOCAL_MODE, if resolved path has no domain_directory.json but
+          execution_layer/input_data does, use the bundled folder so repo-local
+          data is visible when DATA_DIR points at _local_data without a copy of input_data.
+        """
+        requested = (data.get("input_dir") or "").strip()
+        if requested and os.path.isdir(requested):
+            out = os.path.abspath(requested)
+            print(f"[EXECUTION_API] 📥 Using request input_dir: {out}")
+            return out
+
+        resolved_dd = os.path.join(resolved_input_dir, "domain_directory.json")
+        if not os.path.isfile(resolved_dd) and getattr(self, "local_mode", False):
+            execution_layer_dir = os.path.dirname(os.path.abspath(__file__))
+            bundled = os.path.join(execution_layer_dir, "input_data")
+            bundled_dd = os.path.join(bundled, "domain_directory.json")
+            if os.path.isfile(bundled_dd):
+                print(
+                    f"[EXECUTION_API] 📥 Local mode: no domain_directory.json under "
+                    f"{resolved_input_dir}; using {bundled}"
+                )
+                return bundled
+
+        return resolved_input_dir
+
     def _get_session_pseudonymized_flag(self, session_id: str) -> bool:
-        """Read `pseudonymized` flag from Firestore session document (best-effort)."""
+        """Read `pseudonymized` flag from Firestore session document (best-effort).
+        In local mode, always returns False (no Firestore available).
+        """
         if not session_id:
+            return False
+        # Skip Firestore in local mode or when Firebase is not available
+        if getattr(self, 'local_mode', False) or not _FIREBASE_AVAILABLE:
             return False
         try:
             try:
@@ -271,80 +329,63 @@ class ExecutionApi:
     
     def connect_to_api_layer(self, max_retries=5):
         """
-        Connect to API layer Socket.IO for progress streaming.
-
-        Requires API_LAYER_URL. v2 serves Engine.IO at /socket.io (alias /socketio).
-        Optional: EXECUTION_SOCKETIO_PATH (e.g. socket.io or socketio, no leading slash).
+        Connect to API layer's SocketIO server for progress streaming.
+        Skipped in local mode unless ENABLE_SOCKET=true and API_LAYER_URL is set.
         """
-        return self._connect_to_api_layer_unlocked(
-            max_retries=max_retries, sleep_between_rounds=True
-        )
-
-    def _connect_to_api_layer_unlocked(
-        self, *, max_retries: int = 5, sleep_between_rounds: bool = True
-    ) -> bool:
-        if not self.api_layer_url:
+        if self.local_mode and not self.enable_socket:
+            return False
+        if self.sio_client is None:
             return False
 
-        with self._sio_lock:
-            if self.api_layer_connected:
-                return True
-
-        api_url = self.api_layer_url.rstrip("/")
-        base_delay = 1.0
-        env_path = (os.getenv("EXECUTION_SOCKETIO_PATH") or "").strip().lstrip("/")
-        path_candidates: list[str] = []
-        if env_path:
-            path_candidates.append(env_path)
-        for p in ("socket.io", "socketio"):
-            if p not in path_candidates:
-                path_candidates.append(p)
-
-        for attempt in range(max_retries):
-            for sock_path in path_candidates:
-                try:
-                    with self._sio_lock:
-                        if self.api_layer_connected:
-                            return True
-                        try:
-                            self.sio_client.disconnect()
-                        except Exception:
-                            pass
-                        self.sio_client = socketio.SimpleClient()
-                        print(
-                            f"[EXECUTION LAYER] 🔗 Socket.IO connect to {api_url} "
-                            f"(path={sock_path}, round {attempt + 1}/{max_retries})"
-                        )
-                        self.sio_client.connect(
-                            api_url,
-                            socketio_path=sock_path,
-                            wait_timeout=25,
-                            transports=["websocket", "polling"],
-                        )
-                        self.api_layer_connected = True
-                    print(f"[EXECUTION LAYER] ✅ Socket.IO connected (socketio_path={sock_path})")
-                    return True
-                except Exception as e:
-                    err = str(e)
-                    if len(err) > 220:
-                        err = err[:220] + "..."
-                    with self._sio_lock:
-                        self.api_layer_connected = False
-                    print(
-                        f"[EXECUTION LAYER] ❌ Socket.IO failed "
-                        f"(path={sock_path}, round {attempt + 1}/{max_retries}): {err}"
+        if not self.api_layer_url:
+            print(f"[EXECUTION LAYER] ⚠️ Cannot connect: API_LAYER_URL not set")
+            return False
+        
+        retry_count = 0
+        base_delay = 1  # 1 second
+        
+        while retry_count < max_retries:
+            try:
+                if not self.api_layer_connected:
+                    api_url = self.api_layer_url.rstrip('/')
+                    socketio_url = f"{api_url}/socketio"
+                    print(f"[EXECUTION LAYER] 🔗 Connecting to API layer SocketIO at {socketio_url} (attempt {retry_count + 1}/{max_retries})")
+                    
+                    self.sio_client.connect(
+                        api_url,
+                        socketio_path='socketio',
+                        wait_timeout=20,
+                        transports=['websocket', 'polling']
                     )
-
-            if sleep_between_rounds and attempt + 1 < max_retries:
-                delay = min(30.0, base_delay * (2**attempt))
-                print(f"[EXECUTION LAYER] ⏳ Retrying Socket.IO in {delay:.1f}s...")
-                time.sleep(delay)
-
-        print("[EXECUTION LAYER] ❌ Socket.IO: max retries; live progress disabled (logs still print here)")
+                    
+                    self.api_layer_connected = True
+                    print(f"[EXECUTION LAYER] ✅ Connected to API layer SocketIO at {socketio_url}")
+                    return True
+                else:
+                    return True
+            except Exception as e:
+                retry_count += 1
+                error_msg = str(e)
+                if len(error_msg) > 200:
+                    error_msg = error_msg[:200] + "..."
+                print(f"[EXECUTION LAYER] ❌ Failed to connect to API layer (attempt {retry_count}/{max_retries}): {error_msg}")
+                
+                if retry_count < max_retries:
+                    delay = base_delay * (2 ** (retry_count - 1))
+                    print(f"[EXECUTION LAYER] ⏳ Retrying connection in {delay} seconds...")
+                    time.sleep(delay)
+                else:
+                    print(f"[EXECUTION LAYER] ❌ Max connection retries reached, giving up")
+                    self.api_layer_connected = False
+                    return False
+        
         return False
 
     def _create_milestone(self, job_id: str, name: str, description: str, data: dict = None):
-        """Create a milestone via HTTP API. Used for granular progress from execution layer."""
+        """Create a milestone via HTTP API. No-op in local mode unless ENABLE_SOCKET=true."""
+        if self.local_mode and not self.enable_socket:
+            print(f"[LOCAL] 🏁 Milestone [{name}]: {description}")
+            return
         if not self.api_layer_url:
             return
         if not job_id:
@@ -360,12 +401,7 @@ class ExecutionApi:
             payload = {"job_id": job_id, "name": name, "description": description}
             if data:
                 payload["data"] = data
-            resp = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=10,
-            )
+            resp = requests.post(url, json=payload, headers=headers, timeout=10)
             if resp.status_code != 200:
                 # Job framework milestones require a valid Job Framework job_id.
                 # SimpleQnA query_id values are not Job IDs, so suppress repeated 404s.
@@ -377,38 +413,37 @@ class ExecutionApi:
             print(f"[EXECUTION LAYER] ⚠️ Milestone API error: {e}")
 
     def _emit_progress(self, job_id: str, stage: str, message: str, emoji: str = ""):
-        """Emit progress to API layer via Socket.IO; always mirror to stdout for the container terminal."""
+        """Emit progress event. In local mode, print to console only (no SocketIO)."""
+        # Local mode: just print progress to the terminal
+        if self.local_mode and not getattr(self, "enable_socket", False):
+            print(f"[LOCAL] 📊 [{job_id}] {emoji} {stage}: {message}")
+            return
+        
         progress_event = ProgressEvent(job_id, stage, message, 0, emoji)
-        payload = progress_event.to_dict()
-
-        # Terminal mirror (independent of Socket.IO) so operators always see analysis steps.
-        print(f"[EXECUTION LAYER] {emoji} {stage}: {message}", flush=True)
-
-        with self._sio_lock:
-            need_connect = not self.api_layer_connected
-        if need_connect:
-            self._connect_to_api_layer_unlocked(max_retries=1, sleep_between_rounds=False)
-
+        
         try:
-            with self._sio_lock:
-                if self.api_layer_connected:
-                    self.sio_client.emit("execution_progress", payload)
-                    return
+            if self.api_layer_connected:
+                self.sio_client.emit('execution_progress', progress_event.to_dict())
+                print(f"[EXECUTION LAYER] 📡 Progress streamed: {emoji} {stage}: {message}")
+            else:
+                print(f"[EXECUTION LAYER] 🔄 Connection lost, attempting to reconnect...")
+                if self.connect_to_api_layer():
+                    self.sio_client.emit('execution_progress', progress_event.to_dict())
+                    print(f"[EXECUTION LAYER] 📡 Progress streamed after reconnection: {emoji} {stage}: {message}")
+                else:
+                    print(f"[EXECUTION LAYER] ⚠️  Progress (no connection): {emoji} {stage}: {message}")
         except Exception as e:
-            print(f"[EXECUTION LAYER] ❌ Error emitting progress: {e}", flush=True)
-            with self._sio_lock:
-                self.api_layer_connected = False
-
-        try:
-            self._connect_to_api_layer_unlocked(max_retries=3, sleep_between_rounds=False)
-            with self._sio_lock:
-                if self.api_layer_connected:
-                    self.sio_client.emit("execution_progress", payload)
-                    return
-        except Exception as retry_error:
-            print(f"[EXECUTION LAYER] ❌ Progress reconnect failed: {retry_error}", flush=True)
-            with self._sio_lock:
-                self.api_layer_connected = False
+            print(f"[EXECUTION LAYER] ❌ Error emitting progress: {e}")
+            self.api_layer_connected = False
+            try:
+                if self.connect_to_api_layer():
+                    self.sio_client.emit('execution_progress', progress_event.to_dict())
+                    print(f"[EXECUTION LAYER] 📡 Progress streamed after error recovery: {emoji} {stage}: {message}")
+                else:
+                    print(f"[EXECUTION LAYER] 📝 Progress (fallback): {emoji} {stage}: {message}")
+            except Exception as retry_error:
+                print(f"[EXECUTION LAYER] ❌ Retry failed: {retry_error}")
+                print(f"[EXECUTION LAYER] 📝 Progress (fallback): {emoji} {stage}: {message}")
     
     # REMOVED: register_socketio_events() - no longer needed since we removed the SocketIO instance
     # All WebSocket communication now handled by main API layer
@@ -525,10 +560,19 @@ class ExecutionApi:
             # Create job-specific lock path
             job_lock_path = os.path.join(self.locks_dir, f'{job_id}.lock')
             
-            # File-based guard: if lock exists, reject as busy
+            force = str(data.get("force", "true")).strip().lower() in {"1", "true", "yes", "on"}
             if os.path.exists(job_lock_path):
-                print(f"[EXECUTION_API] ⚠️ analyze_job busy for job_id={job_id}")
-                return jsonify({'status': 'busy', 'error': f'Analysis already in progress for job {job_id}'}), 409
+                if force:
+                    try:
+                        os.remove(job_lock_path)
+                        print(f"[EXECUTION_API] 🧹 Cleared previous analyze_job lock (force=true): {job_lock_path}")
+                    except Exception as e:
+                        print(f"[EXECUTION_API] ⚠️ Could not clear analyze_job lock: {e}")
+                else:
+                    _clear_lock_if_stale(job_lock_path)
+                    if os.path.exists(job_lock_path):
+                        print(f"[EXECUTION_API] ⚠️ analyze_job busy for job_id={job_id}")
+                        return jsonify({'status': 'busy', 'error': f'Analysis already in progress for job {job_id}'}), 409
             
             try:
                 # Run analysis for the specific job
@@ -564,7 +608,7 @@ class ExecutionApi:
                 "chat_id": "...",      # Chat ID (for metadata only)
                 "query_id": "...",     # Query ID (used for path resolution)
                 "query": "...",        # User question
-                "model": "gpt-5.4",    # LLM model
+                "model": ENFORCED_MODEL,    # LLM model
                 "session_id": "...",   # Session ID
                 "user_id": "...",      # User ID
                 "user_email": "...",   # User email (for path resolution)
@@ -609,7 +653,7 @@ class ExecutionApi:
             try:
                 # Get job parameters
                 user_query = data['query']
-                model_name = self._resolve_model_name(data.get('model'))
+                model_name = data.get('model', ENFORCED_MODEL)
                 session_id = data.get('session_id', '')
                 user_email = data.get('user_email')
                 user_email_sanitized = data.get('user_email_sanitized')
@@ -629,12 +673,13 @@ class ExecutionApi:
                     }), 499
                 
                 # Resolve job-specific directories (Cloud Run only)
-                job_input_dir, job_output_dir = self._resolve_paths(
+                resolved_in, job_output_dir = self._resolve_paths(
                     user_email=user_email,
                     user_email_sanitized=user_email_sanitized,
                     job_id=job_id,
                     session_id=session_id,
                 )
+                job_input_dir = self._effective_job_input_dir(data, resolved_in)
                 
                 print(f"🔧 [CLOUD_RUN] Setting up Simple QnA job {job_id} directories:")
                 print(f"📥 Cloud Run input dir: {job_input_dir} (session shared)")
@@ -863,7 +908,7 @@ class ExecutionApi:
                 }), 499  # Client Closed Request
 
             user_query = data['query']
-            model_name = self._resolve_model_name(data.get('model'))
+            model_name = data.get('model', ENFORCED_MODEL)
             
             # Resolve session-level directories (Cloud Run only)
             session_input_dir, session_output_dir = self._resolve_paths(
@@ -980,11 +1025,13 @@ class ExecutionApi:
         # Default pricing per 1K tokens
         model_pricing = {
             "gpt-5.4": {"input": 0.002, "output": 0.008},
-            "gpt-5.4-mini": {"input": 0.0004, "output": 0.0016},
+            "gpt-4.1": {"input": 0.002, "output": 0.008},
+            "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
+            "gpt-4.1-mini": {"input": 0.0004, "output": 0.0016},
         }
         
         # Get pricing for model or use default
-        pricing = model_pricing.get(model_name, model_pricing["gpt-5.4"])
+        pricing = model_pricing.get(model_name, {"input": 0.002, "output": 0.008})
         
         try:
             # Convert to cost per 1000 tokens
@@ -1082,7 +1129,7 @@ class ExecutionApi:
         g.set_finish_point("data_analysis_agent")
         
         return g.compile()
-
+#Everything you built (locks, paths, streaming, cancellation, metrics) comes together here
     def run_job_analysis(self, data, job_lock_path):
         """Run analysis for a specific job with JOB-SPECIFIC directories (FIXED VERSION)"""
         # Ensure job_id is always available for error/cleanup paths
@@ -1091,8 +1138,9 @@ class ExecutionApi:
             # Get job parameters (needed for path resolution and idempotency check)
             job_id = data['job_id']
             user_query = data['query']
-            model_name = self._resolve_model_name(data.get('model'))
-            analysis_mode = data.get('analysis_mode', 'slim')
+            model_name = data.get('model', ENFORCED_MODEL)
+            analysis_mode = data.get('analysis_mode', DEFAULT_ANALYSIS_MODE)
+            normalized_mode = normalize_analysis_mode(analysis_mode)
             user_email = data.get('user_email')
             user_email_sanitized = data.get('user_email_sanitized')
             session_id = data.get('session_id', '')
@@ -1103,12 +1151,13 @@ class ExecutionApi:
             host_output_dir = data.get('output_dir', '')
             
             # Resolve Cloud Run paths (/data via GCS FUSE mount)
-            job_input_dir, job_output_dir = self._resolve_paths(
+            resolved_in, job_output_dir = self._resolve_paths(
                 user_email=user_email,
                 user_email_sanitized=user_email_sanitized,
                 job_id=job_id,
                 session_id=session_id,
             )
+            job_input_dir = self._effective_job_input_dir(data, resolved_in)
             
             # IDEMPOTENCY: If job already completed (report exists), return cached result without re-running.
             # Prevents duplicate analysis from HTTP retries (e.g. connection drop after container sends 200).
@@ -1141,10 +1190,11 @@ class ExecutionApi:
                     'error': f'Analysis already in progress for job {job_id}'
                 }
             
-            print(f"🔧 [CLOUD_RUN] Setting up job {job_id} directories:")
-            print(f"📥 Cloud Run input dir: {job_input_dir} (session shared)")
-            print(f"📤 Cloud Run output dir: {job_output_dir} (job-specific)")
-            print(f"🏠 Host output will be at: {host_output_dir}")
+            mode_tag = "LOCAL" if getattr(self, 'local_mode', False) else "CLOUD_RUN"
+            print(f"🔧 [{mode_tag}] Setting up job {job_id} directories:")
+            print(f"📥 [{mode_tag}] input dir: {job_input_dir} (session shared)")
+            print(f"📤 [{mode_tag}] output dir: {job_output_dir} (job-specific)")
+            print(f"🏠 [{mode_tag}] host output will be at: {host_output_dir}")
             
             # Create job-specific output directory WITHIN the session mount
             # No need to create input dir - using shared session input
@@ -1159,9 +1209,9 @@ class ExecutionApi:
                 except Exception:
                     pass
             
-            print(f"✅ [CLOUD_RUN] Starting job analysis {job_id} with JOB-SPECIFIC directories")
-            print(f"🔍 Job input dir (Cloud Run): {job_input_dir}")
-            print(f"💾 Job output dir (Cloud Run): {job_output_dir}")
+            print(f"✅ [{mode_tag}] Starting job analysis {job_id} with JOB-SPECIFIC directories")
+            print(f"🔍 Job input dir: {job_input_dir}")
+            print(f"💾 Job output dir: {job_output_dir}")
             print(f"🗂️ Host output dir: {host_output_dir}")
             print(f"📝 Query: {user_query}")
             print(f"🤖 Model: {model_name}")
@@ -1253,6 +1303,7 @@ class ExecutionApi:
                 "metrics": metrics,  
                 "model_name": model_name,
                 "analysis_mode": analysis_mode,
+                "question_depth": "shallow" if normalized_mode == "slim" else "deep",
                 "output_dir": job_output_dir,  # ✅ FIXED: Use JOB-SPECIFIC output dir
                 "input_dir": job_input_dir,    # ✅ FIXED: Use JOB-SPECIFIC input dir
                 "job_id": job_id,
@@ -1266,7 +1317,7 @@ class ExecutionApi:
                 "milestone_callback": lambda desc, name=None, data=None: self._create_milestone(
                     job_id, name or (desc[:50].replace(" ", "_").lower()), desc, data
                 ),
-            }
+            } # - central object passed to all agents
 
             # Create data analysis agent with JOB-SPECIFIC output directory  
             data_analysis_agent = DataAnalysisAgent(output_dir=job_output_dir)
@@ -1281,7 +1332,7 @@ class ExecutionApi:
             print("Running job analysis")
             
             # Run the analysis
-            state = asyncio.run(compiled.ainvoke(state))
+            state = asyncio.run(compiled.ainvoke(state)) # actual pipeline execution
             
             # Check if processing was cancelled
             if state.get("cancelled"):
@@ -1289,19 +1340,6 @@ class ExecutionApi:
                 return {
                     'status': 'cancelled',
                     'message': 'Job was cancelled by user',
-                    'job_id': job_id,
-                    'metrics': state.get("metrics", {}),
-                }
-
-            # Fail explicitly when the pipeline reports an internal error.
-            if state.get("error"):
-                err_msg = str(state.get("error"))
-                print(f"❌ [CLOUD_RUN] Job {job_id} failed in pipeline: {err_msg}")
-                return {
-                    'status': 'error',
-                    'error': err_msg,
-                    'error_type': 'analysis_pipeline_error',
-                    'error_code': 'ANALYSIS_PIPELINE_ERROR',
                     'job_id': job_id,
                     'metrics': state.get("metrics", {}),
                 }
@@ -1372,16 +1410,6 @@ class ExecutionApi:
             except Exception as e:
                 print(f"Error reading/writing report file: {str(e)}")
                 report_str = f"<p>Error with report: {str(e)}</p>"
-
-            if not report_str or report_str == "<p>No report generated</p>":
-                return {
-                    'status': 'error',
-                    'error': 'Analysis finished without generating analysis_report.html',
-                    'error_type': 'missing_report',
-                    'error_code': 'MISSING_REPORT',
-                    'job_id': job_id,
-                    'metrics': state.get("metrics", {}),
-                }
             
             print(f"✅ [CONTAINER] Job {job_id} analysis completed successfully")
             
@@ -1480,7 +1508,7 @@ class ExecutionApi:
 
             # Get analysis parameters
             user_query = data['query']
-            model_name = self._resolve_model_name(data.get('model'))
+            model_name = data.get('model', ENFORCED_MODEL)
             # Cloud Run: container_id not used (each Cloud Run instance is isolated)
             # container_id = data.get('container_id', '')  # Legacy Docker field - not used in Cloud Run
             user_email = data.get('user_email', '')
@@ -1510,6 +1538,8 @@ class ExecutionApi:
                     safe_user = self._sanitize_email_for_storage(user_email) if user_email else "anonymous"
                     safe_session = session_id or "no_session"
                     input_dir = os.path.join(self.data_dir, safe_user, safe_session, "input_data")
+
+            input_dir = self._effective_job_input_dir(data, input_dir)
 
             print(f"Starting analysis for query: {user_query} using model: {model_name}")
             print(f"📊 [TOKEN MANAGEMENT] User: {user_email}, Tokens: {user_token_info.get('used_token', 0)}/{user_token_info.get('issued_token', 0)} (remaining: {user_token_info.get('remaining_token', 0)})")
@@ -1565,7 +1595,7 @@ class ExecutionApi:
                 "last_output": "",
                 "last_error": None,
                 "metrics": metrics,  
-                "model_name": self._resolve_model_name(data.get('model')),
+                "model_name": model_name,
                 "user_email": user_email,
                 "session_pseudonymized": self._get_session_pseudonymized_flag(data.get('session_id', '')),
                 "user_token_info": user_token_info,  # Pass token info for internal tracking

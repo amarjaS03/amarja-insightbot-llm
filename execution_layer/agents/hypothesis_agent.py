@@ -7,11 +7,12 @@ import base64
 from typing import List, Dict, Any
 from pathlib import Path
 
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from agents.llm_client import llm_call
 from langchain_core.runnables import Runnable
 from agents.executor import CodeAgent
 from agents.analysis_mode import normalize_analysis_mode, hypothesis_task_count
+from agents.llm_client import ENFORCED_MODEL, vision_image_mime_subtype
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -67,8 +68,7 @@ Based on the EDA summary, generate specific hypotheses that can be tested with s
 
 ## Visualization Specifications
 Restrict to interpretable statistical visualizations:
-- Generate clear, labeled visualizations with business-friendly titles and legends
-- CRITICAL for exported PNGs: chart titles, subtitles, and suptitles must describe the business question only (e.g. "Correlation: ride distance vs. booking value"). Do NOT put "Hypothesis 1", "Hypothesis 2", hypothesis IDs, or internal test labels in any visible plot text—those are for filenames only.
+- Generate clear, labeled visualizations with business-friendly titles and legends 
 - Bar charts, line graphs, histograms for distribution analysis
 - Scatter plots for correlation testing
 - Pie charts for categorical proportion analysis
@@ -95,11 +95,7 @@ Create a simple nl command for testing this hypothesis. Include:
 2. Which columns to use(refer from domain directory) 
 3. What statistical test or analysis to do
 4. What chart/visualization to create(only pie, bar, line charts and heatmaps)
-5. Use "hypothesis_{hypothesis['id']}_" prefix for all saved **file names** on disk only.
-
-CRITICAL — visible chart text (titles, suptitles, labels shown in the PNG):
-- Use stakeholder-facing wording only (metrics and dimensions), e.g. "Average booking value by vehicle type" or "Correlation between ride distance and booking value".
-- Never instruct code to display "Hypothesis N", hypothesis numbers, or internal IDs on the figure; those belong in filenames, not on the chart.
+5. Use "hypothesis_{hypothesis['id']}_" prefix for all saved files
 
 Response format (JSON):
 {
@@ -150,6 +146,8 @@ Use simple language that non-technical stakeholders can understand."""
 
 class HypothesisAgent(Runnable):
     def __init__(self, output_dir):
+        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.model = (os.getenv("MODEL_NAME") or ENFORCED_MODEL).strip() or ENFORCED_MODEL
         self.output_dir = Path(output_dir)  # Convert to Path object
         print("output_dir in HypothesisAgent", self.output_dir)
         # Lazily created. Creating a new CodeAgent repeatedly is slow and leaks kernels.
@@ -204,19 +202,30 @@ class HypothesisAgent(Runnable):
 # - EDA Files(curated by eda agent and saved in output_data/eda directory): {eda_files}
         
         try:
-            messages = [
-                {"role": "system", "content": HYPOTHESIS_COMMAND_GENERATION_PROMPT},
-                {"role": "user", "content": command_context},
-            ]
-            content, usage = await llm_call(messages, json_response=True, max_output_tokens=400)
-            if not content:
-                content = "{}"
+            response = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": HYPOTHESIS_COMMAND_GENERATION_PROMPT},
+                    {"role": "user", "content": command_context}
+                ],
+                text={"format": {"type": "json_object"}},
+                max_output_tokens=400
+            )
 
             # Update metrics in state
-            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
-            state["metrics"]["completion_tokens"] += usage["output_tokens"]
-            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
+            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
+            state["metrics"]["total_tokens"] += (
+                getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+            )
             state["metrics"]["successful_requests"] += 1
+
+            content = getattr(response, "output_text", None)
+            if not content:
+                try:
+                    content = response.output[0].content[0].text
+                except Exception:
+                    content = "{}"
             
             try:
                 result = json.loads(content)
@@ -228,7 +237,7 @@ class HypothesisAgent(Runnable):
                 for i, log in enumerate(thinking_logs):
                     progress_callback(f"🤖 Command Gen #{i+1}", log, "⚗️")
                     # Small delay to make logs visible
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.03)
                 
                 generated_command = result.get("command", "")
             except json.JSONDecodeError:
@@ -353,19 +362,30 @@ class HypothesisAgent(Runnable):
         """
 
         try:
-            messages = [
-                {"role": "system", "content": HYPOTHESIS_GENERATION_PROMPT},
-                {"role": "user", "content": eda_context},
-            ]
-            content, usage = await llm_call(messages, json_response=True, max_output_tokens=800)
-            if not content:
-                content = "{}"
+            response = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": HYPOTHESIS_GENERATION_PROMPT},
+                    {"role": "user", "content": eda_context}
+                ],
+                text={"format": {"type": "json_object"}},
+                max_output_tokens=800
+            )
 
             # Update metrics in state
-            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
-            state["metrics"]["completion_tokens"] += usage["output_tokens"]
-            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
+            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
+            state["metrics"]["total_tokens"] += (
+                getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+            )
             state["metrics"]["successful_requests"] += 1
+            
+            content = getattr(response, "output_text", None)
+            if not content:
+                try:
+                    content = response.output[0].content[0].text
+                except Exception:
+                    content = "{}"
             
             try:
                 result = json.loads(content)
@@ -377,7 +397,7 @@ class HypothesisAgent(Runnable):
                 for i, log in enumerate(thinking_logs):
                     progress_callback(f"🤖 Hypothesis LLM #{i+1}", log, "🔬")
                     # Small delay to make logs visible
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.03)
                 
                 milestone_cb = state.get("milestone_callback", lambda *a, **k: None)
                 milestone_cb("Hypothesis: Hypotheses generated successfully", "hypothesis_generated", {"dependency": "sequential", "is_llm_call": True})
@@ -394,7 +414,7 @@ class HypothesisAgent(Runnable):
                         
                         for i, log in enumerate(thinking_logs):
                             progress_callback(f"🤖 Hypothesis LLM #{i+1}", log, "🔬")
-                            await asyncio.sleep(0.2)
+                            await asyncio.sleep(0.03)
 
                         milestone_cb = state.get("milestone_callback", lambda *a, **k: None)
                         milestone_cb("Hypothesis: Hypotheses generated (fallback parse)", "hypothesis_generated", {"dependency": "sequential", "is_llm_call": True})
@@ -461,38 +481,18 @@ Make sure visualizations clearly show whether the hypothesis is supported or rej
             "visualization_paths": result_state.get("image_paths", [])
         }
 
-    async def synthesize_hypothesis_results(self,state: dict) -> str:
-        """Iteratively read each judge summary file and build a synthesis incrementally.
+    async def _synthesize_hypothesis_results_sequential(
+        self, judge_files: List, pattern: re.Pattern, state: dict
+    ) -> Dict[str, Any]:
+        """Original one-LLM-call-per-judge-summary path (fallback if batched synthesis fails)."""
+        import json as _json
+        import textwrap as _textwrap
 
-        We process one file at a time to stay within context limits. After each file we:
-        1. Ask the LLM to evaluate support status and produce a JSON finding.
-        2. Ask the LLM to extend/refine an overall synthesis (passed back in every step).
-        The final synthesis after the last file is returned and the list of findings is
-        stored in ``state['hypothesis_findings']``.
-        """
+        findings: List[Dict[str, Any]] = []
+        findings_jsonl = ""
+        current_synthesis = ""
 
-        from pathlib import Path
-        import re, json, textwrap
-
-                # hypo_dir = "/output_data"
-        # Updated to use flat output directory path
-        hypo_dir = self.output_dir
-        pattern = re.compile(r"^hypothesis_(\d+)_judge_summary\.txt$")
-
-        if not hypo_dir.exists():
-            logger.warning("Hypothesis directory not found, skipping synthesis.")
-            state["hypothesis_findings"] = []
-            return "No hypothesis judge summaries were found."
-
-        # Collect and sort files numerically
-        judge_files = [fp for fp in hypo_dir.iterdir() if fp.is_file() and pattern.match(fp.name)]
-        judge_files.sort(key=lambda p: int(pattern.match(p.name).group(1)))
-
-        findings = []            # python list holding dicts for each hypothesis
-        findings_jsonl = ""      # newline-delimited JSON objects used as compact context
-        current_synthesis = ""   # incrementally updated synthesis text returned by LLM
-
-        STEP_PROMPT = textwrap.dedent(
+        STEP_PROMPT = _textwrap.dedent(
             """
             You are an expert data scientist reviewing *one* hypothesis judge summary at a time.
             TASKS:
@@ -515,6 +515,7 @@ Make sure visualizations clearly show whether the hypothesis is supported or rej
             """
         )
 
+        milestone_cb = state.get("milestone_callback", lambda *a, **k: None)
         for file_path in judge_files:
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
@@ -530,48 +531,185 @@ Make sure visualizations clearly show whether the hypothesis is supported or rej
             )
 
             try:
-                messages = [
-                    {"role": "system", "content": STEP_PROMPT},
-                    {"role": "user", "content": user_msg},
-                ]
-                content, usage = await llm_call(messages, json_response=True, max_output_tokens=600)
-                if not content:
-                    content = "{}"
+                response = await self.client.responses.create(
+                    model=self.model,
+                    input=[
+                        {"role": "system", "content": STEP_PROMPT},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    text={"format": {"type": "json_object"}},
+                    max_output_tokens=600,
+                )
 
-                if isinstance(state.get("metrics"), dict):
-                    state["metrics"]["prompt_tokens"] += usage["input_tokens"]
-                    state["metrics"]["completion_tokens"] += usage["output_tokens"]
-                    state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+                if hasattr(response, "usage") and isinstance(state.get("metrics"), dict):
+                    state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
+                    state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
+                    state["metrics"]["total_tokens"] += (
+                        getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+                    )
                     state["metrics"]["successful_requests"] += 1
 
-                parsed = json.loads(content)
+                content = getattr(response, "output_text", None)
+                if not content:
+                    try:
+                        content = response.output[0].content[0].text
+                    except Exception:
+                        content = "{}"
 
+                parsed = _json.loads(content)
                 finding = parsed.get("finding")
                 synthesis_text = parsed.get("synthesis", "")
 
                 if finding:
                     finding["file_path"] = str(file_path)
                     findings.append(finding)
-                    findings_jsonl += json.dumps(finding) + "\n"
+                    findings_jsonl += _json.dumps(finding) + "\n"
 
                 current_synthesis = synthesis_text.strip() if synthesis_text else current_synthesis
-                milestone_cb = state.get("milestone_callback", lambda *a, **k: None)
-                milestone_cb(f"Hypothesis: LLM synthesis step {file_path.name}", "hypothesis_synthesis_step", {"file": file_path.name, "dependency": "sequential", "is_llm_call": True})
+                milestone_cb(
+                    f"Hypothesis: LLM synthesis step {file_path.name}",
+                    "hypothesis_synthesis_step",
+                    {"file": file_path.name, "dependency": "sequential", "is_llm_call": True},
+                )
 
             except Exception as e:
                 logger.error(f"LLM processing failed for {file_path.name}: {e}")
                 continue
 
-        # After all files processed
-        # Store results in state for downstream agents
-        # state["hypothesis_findings"] = findings  # list of structured findings per hypothesis id
-        # state["hypothesis_summary"] = current_synthesis  # combined synthesis text
-
-        # Return a simple dict for immediate access if caller needs it
         return {
             "hypothesis_findings": findings,
-            "hypothesis_summary": current_synthesis if current_synthesis else "No synthesis generated."
+            "hypothesis_summary": current_synthesis if current_synthesis else "No synthesis generated.",
         }
+
+    async def _synthesize_hypothesis_results_batched(
+        self, judge_files: List, pattern: re.Pattern, state: dict
+    ) -> Dict[str, Any] | None:
+        """Single LLM pass over all judge summaries; returns None if output is unusable."""
+        import json as _json
+        import textwrap as _textwrap
+
+        _PER_FILE_CAP = 18_000
+        blocks: List[str] = []
+        expected_ids: set[int] = set()
+        for fp in judge_files:
+            m = pattern.match(fp.name)
+            if not m:
+                continue
+            hid = int(m.group(1))
+            expected_ids.add(hid)
+            try:
+                raw = fp.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                return None
+            snippet = raw if len(raw) <= _PER_FILE_CAP else raw[:_PER_FILE_CAP] + "\n...[truncated]..."
+            blocks.append(f"### FILE {fp.name} (hypothesis_id={hid})\n{snippet}")
+
+        combined = "\n\n".join(blocks)
+        BATCH_PROMPT = _textwrap.dedent(
+            """
+            You are given multiple hypothesis judge summary files (raw text). For EACH file:
+            1. Decide SUPPORTED, REJECTED, or INCONCLUSIVE from the evidence.
+            2. Emit one finding object with keys: hypothesis_id (int), hypothesis (short string),
+               result_status, result, rationale (one sentence).
+
+            Also write "synthesis": a single executive summary (max 200 words) covering all hypotheses.
+
+            Return STRICT JSON only:
+            {"findings": [ {...}, ... ], "synthesis": "..."}
+            The findings array MUST have exactly one entry per hypothesis file, with matching hypothesis_id.
+            """
+        )
+
+        try:
+            response = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": BATCH_PROMPT},
+                    {"role": "user", "content": combined},
+                ],
+                text={"format": {"type": "json_object"}},
+                max_output_tokens=4000,
+            )
+            if hasattr(response, "usage") and isinstance(state.get("metrics"), dict):
+                state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
+                state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
+                state["metrics"]["total_tokens"] += (
+                    getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+                )
+                state["metrics"]["successful_requests"] += 1
+
+            content = getattr(response, "output_text", None)
+            if not content:
+                try:
+                    content = response.output[0].content[0].text
+                except Exception:
+                    content = "{}"
+            parsed = _json.loads(content)
+            findings = parsed.get("findings")
+            synthesis = (parsed.get("synthesis") or "").strip()
+            if not isinstance(findings, list) or not findings:
+                return None
+            got_ids: set[int] = set()
+            cleaned: List[Dict[str, Any]] = []
+            for f in findings:
+                if not isinstance(f, dict):
+                    return None
+                try:
+                    hid = int(f.get("hypothesis_id"))
+                except (TypeError, ValueError):
+                    return None
+                got_ids.add(hid)
+                f = dict(f)
+                f["file_path"] = str(Path(self.output_dir) / f"hypothesis_{hid}_judge_summary.txt")
+                cleaned.append(f)
+            if got_ids != expected_ids or len(cleaned) != len(expected_ids):
+                return None
+            milestone_cb = state.get("milestone_callback", lambda *a, **k: None)
+            milestone_cb(
+                "Hypothesis: batched synthesis",
+                "hypothesis_synthesis_batched",
+                {"files": [p.name for p in judge_files], "dependency": "sequential", "is_llm_call": True},
+            )
+            return {
+                "hypothesis_findings": cleaned,
+                "hypothesis_summary": synthesis if synthesis else "No synthesis generated.",
+            }
+        except Exception as e:
+            logger.warning(f"Batched hypothesis synthesis failed: {e}")
+            return None
+
+    async def synthesize_hypothesis_results(self, state: dict) -> Dict[str, Any]:
+        """Build hypothesis_findings + hypothesis_summary (batched LLM; sequential fallback)."""
+
+        from pathlib import Path
+
+        hypo_dir = Path(self.output_dir)
+        pattern = re.compile(r"^hypothesis_(\d+)_judge_summary\.txt$")
+        empty: Dict[str, Any] = {
+            "hypothesis_findings": [],
+            "hypothesis_summary": "No hypothesis judge summaries were found.",
+        }
+
+        if not hypo_dir.exists():
+            logger.warning("Hypothesis directory not found, skipping synthesis.")
+            state["hypothesis_findings"] = []
+            return empty
+
+        judge_files = [fp for fp in hypo_dir.iterdir() if fp.is_file() and pattern.match(fp.name)]
+        judge_files.sort(key=lambda p: int(pattern.match(p.name).group(1)))
+        if not judge_files:
+            state["hypothesis_findings"] = []
+            return {
+                "hypothesis_findings": [],
+                "hypothesis_summary": "No synthesis generated.",
+            }
+
+        batched = await self._synthesize_hypothesis_results_batched(judge_files, pattern, state)
+        if batched is not None:
+            return batched
+
+        logger.info("Hypothesis synthesis: using sequential fallback after batched path failed")
+        return await self._synthesize_hypothesis_results_sequential(judge_files, pattern, state)
     
     async def _analyze_text_files(self, created_files: List[str], hypothesis_id: int) -> str:
             """Analyze all text files for the hypothesis"""
@@ -616,21 +754,22 @@ Make sure visualizations clearly show whether the hypothesis is supported or rej
         return data_analysis if data_analysis else "No data files found for analysis."
 
     async def _analyze_images_for_hypothesis(self, created_files: List[str], hypothesis_id: int, hypothesis_statement: str, state: dict) -> List[Dict]:
-        """Analyze all images using Vision API and return combined analysis"""
-        image_files = [f for f in created_files if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        
+        """Analyze all images using Vision API (parallel, same prompts/caps as before)."""
+        image_files = [f for f in created_files if f.lower().endswith((".png", ".jpg", ".jpeg"))]
         if not image_files:
             return []
-        
-        image_analyses = []
-        
-        for img_path in image_files:
-            try:
-                base64_image = self.encode_image_to_base64(img_path)
-                if not base64_image:
-                    continue
-                
-                vision_context = f"""
+
+        semaphore = asyncio.Semaphore(4)
+
+        async def _one(img_path: str) -> Dict[str, str]:
+            async with semaphore:
+                try:
+                    base64_image = self.encode_image_to_base64(img_path)
+                    if not base64_image:
+                        return {"img": Path(img_path).name, "description": ""}
+                    p = Path(img_path)
+                    mime_sub = vision_image_mime_subtype(p.suffix)
+                    vision_context = f"""
     Analyze this visualization for Hypothesis {hypothesis_id}:
     "{hypothesis_statement}"
 
@@ -638,41 +777,43 @@ Make sure visualizations clearly show whether the hypothesis is supported or rej
 
     Provide detailed analysis of what this chart shows and how it relates to testing the hypothesis.
     """
-                
-                vision_messages = [
-                    {"role": "system", "content": VISION_ANALYSIS_PROMPT},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": vision_context},
+                    vision_response = await self.client.responses.create(
+                        model=self.model,
+                        input=[
+                            {"role": "system", "content": VISION_ANALYSIS_PROMPT},
                             {
-                                "type": "input_image",
-                                "image_url": f"data:image/png;base64,{base64_image}",
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": vision_context},
+                                    {
+                                        "type": "input_image",
+                                        "image_url": f"data:image/{mime_sub};base64,{base64_image}",
+                                    },
+                                ],
                             },
                         ],
-                    },
-                ]
-                analysis_text, usage = await llm_call(vision_messages, max_output_tokens=600)
+                        max_output_tokens=600,
+                    )
+                    if hasattr(vision_response, "usage") and isinstance(state.get("metrics"), dict):
+                        state["metrics"]["prompt_tokens"] += getattr(vision_response.usage, "input_tokens", 0)
+                        state["metrics"]["completion_tokens"] += getattr(vision_response.usage, "output_tokens", 0)
+                        state["metrics"]["total_tokens"] += (
+                            getattr(vision_response.usage, "input_tokens", 0)
+                            + getattr(vision_response.usage, "output_tokens", 0)
+                        )
+                        state["metrics"]["successful_requests"] += 1
+                    analysis_text = getattr(vision_response, "output_text", None)
+                    if not analysis_text:
+                        try:
+                            analysis_text = vision_response.output[0].content[0].text
+                        except Exception:
+                            analysis_text = ""
+                    return {"img": Path(img_path).name, "description": analysis_text or ""}
+                except Exception as e:
+                    logger.error(f"Error analyzing image {img_path}: {e}")
+                    return {"img": Path(img_path).name, "description": f"Error analyzing image: {str(e)}"}
 
-                # Update metrics in state
-                state["metrics"]["prompt_tokens"] += usage["input_tokens"]
-                state["metrics"]["completion_tokens"] += usage["output_tokens"]
-                state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
-                state["metrics"]["successful_requests"] += 1
-
-                image_analyses.append({
-                    "img": Path(img_path).name,
-                    "description": analysis_text
-                })
-                
-            except Exception as e:
-                logger.error(f"Error analyzing image {img_path}: {e}")
-                image_analyses.append({
-                    "img": Path(img_path).name,
-                    "description": f"Error analyzing image: {str(e)}"
-                })
-        
-        return image_analyses
+        return list(await asyncio.gather(*[_one(p) for p in image_files]))
     
     async def _make_final_judgment(self, hypothesis_id: int, hypothesis_statement: str, generated_command: str,
                              text_analysis: str, data_analysis: str, image_analysis: List[Dict], state: dict) -> str:
@@ -704,18 +845,29 @@ Make sure visualizations clearly show whether the hypothesis is supported or rej
     """
         
         try:
-            messages = [
-                {"role": "system", "content": HYPOTHESIS_JUDGMENT_PROMPT},
-                {"role": "user", "content": judgment_context},
-            ]
-            content, usage = await llm_call(messages, max_output_tokens=1000)
-
+            judgment_response = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": HYPOTHESIS_JUDGMENT_PROMPT},
+                    {"role": "user", "content": judgment_context}
+                ],
+                max_output_tokens=1000
+            )
+            
             # Update metrics in state
-            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
-            state["metrics"]["completion_tokens"] += usage["output_tokens"]
-            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+            state["metrics"]["prompt_tokens"] += getattr(judgment_response.usage, "input_tokens", 0)
+            state["metrics"]["completion_tokens"] += getattr(judgment_response.usage, "output_tokens", 0)
+            state["metrics"]["total_tokens"] += (
+                getattr(judgment_response.usage, "input_tokens", 0) + getattr(judgment_response.usage, "output_tokens", 0)
+            )
             state["metrics"]["successful_requests"] += 1
 
+            content = getattr(judgment_response, "output_text", None)
+            if not content:
+                try:
+                    content = judgment_response.output[0].content[0].text
+                except Exception:
+                    content = ""
             return content
             
         except Exception as e:

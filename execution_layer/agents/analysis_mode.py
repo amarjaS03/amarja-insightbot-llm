@@ -60,19 +60,26 @@ def eda_tasks_per_cycle(_: str) -> int:
 def eda_cycle_count(mode: str, depth: str) -> int:
     if mode == "slim":
         return 1
-    return {"shallow": 1, "medium": 2, "deep": 3}.get(depth, 2)
+    return {"shallow": 1, "medium": 2, "deep": 2}.get(depth, 2)
+
+
+def eda_min_cycles(mode: str, depth: str) -> int:
+    """Minimum EDA cycles that MUST run before the completeness check can stop the loop."""
+    if mode == "slim":
+        return 1
+    return {"shallow": 1, "medium": 1, "deep": 2}.get(depth, 1)
 
 
 def hypothesis_task_count(mode: str, depth: str) -> int:
     if mode == "slim":
         return 0
-    return {"shallow": 2, "medium": 3, "deep": 4}.get(depth, 3)
+    return {"shallow": 2, "medium": 3, "deep": 3}.get(depth, 3)
 
 
 def executor_max_attempts(mode: str, depth: str) -> int:
     if mode == "slim":
         return 2
-    return {"shallow": 1, "medium": 2, "deep": 3}.get(depth, 2)
+    return {"shallow": 1, "medium": 2, "deep": 2}.get(depth, 2)
 
 
 def narrator_verbosity(mode: str) -> str:
