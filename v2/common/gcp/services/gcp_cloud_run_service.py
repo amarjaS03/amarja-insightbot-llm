@@ -135,6 +135,14 @@ class GcpCloudRunService:
             if openai_key:
                 env_map["OPENAI_API_KEY"] = openai_key
 
+            openrouter_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+            if openrouter_key:
+                env_map["OPENROUTER_API_KEY"] = openrouter_key
+
+            model_name = (os.getenv("MODEL_NAME") or "").strip()
+            if model_name:
+                env_map["MODEL_NAME"] = model_name
+
             # Rebuild env list
             containers[0]["env"] = [{"name": k, "value": v} for k, v in env_map.items() if v != ""]
         return service_doc

@@ -3,13 +3,12 @@ import json
 import logging
 import asyncio
 
-from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from langchain_core.runnables import Runnable
 
 from execution_layer.agents.coding_tool import JupyterExecutionTool
 from agents.analysis_mode import normalize_analysis_mode, executor_max_attempts
-from agents.llm_client import ENFORCED_MODEL
+from agents.llm_client import ENFORCED_MODEL, get_async_client, get_model, llm_call
 from agents.token_manager import check_token_limit_internal, complete_job_gracefully, TokenLimitExceededException
 
 # load .env
@@ -234,8 +233,8 @@ class CodeAgent(Runnable):
         # spin up a persistent Jupyter kernel
         self.executor = JupyterExecutionTool()
         self.max_retries = 3
-        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = (os.getenv("MODEL_NAME") or ENFORCED_MODEL).strip() or ENFORCED_MODEL
+        self.client = get_async_client()
+        self.model = get_model()
 
     def _compact_history_for_prompt(self, history: list, *, max_items: int = 4) -> str:
         """
@@ -358,37 +357,26 @@ class CodeAgent(Runnable):
             
             # print(f"[EXECUTOR] {token_message}")
             
-            resp = await self.client.responses.create(
-                model=self.model,
-                input=[
+            content, usage = await llm_call(
+                messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_msg}
+                    {"role": "user", "content": user_msg},
                 ],
-                text={"format": {"type": "json_object"}},
-                max_output_tokens=8000
+                max_output_tokens=4000,
+                json_response=True,
+                seed=42,
             )
-            
+
             # Update metrics in state if available
             if state and "metrics" in state:
-                state["metrics"]["prompt_tokens"] += getattr(resp.usage, "input_tokens", 0) if hasattr(resp, "usage") else 0
-                state["metrics"]["completion_tokens"] += getattr(resp.usage, "output_tokens", 0) if hasattr(resp, "usage") else 0
-                state["metrics"]["total_tokens"] += (
-                    (getattr(resp.usage, "input_tokens", 0) + getattr(resp.usage, "output_tokens", 0)) if hasattr(resp, "usage") else 0
-                )
+                state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+                state["metrics"]["completion_tokens"] += usage["output_tokens"]
+                state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
                 state["metrics"]["successful_requests"] += 1
-            
-            # Log token usage for this call
-            if hasattr(resp, "usage") and resp.usage:
-                tokens_used = getattr(resp.usage, "input_tokens", 0) + getattr(resp.usage, "output_tokens", 0)
-                print(f"[EXECUTOR] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
-            
-            content = getattr(resp, "output_text", None)
-            if not content:
-                try:
-                    content = resp.output[0].content[0].text
-                except Exception:
-                    content = "{}"
-            
+                state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
+                print(f"[EXECUTOR] Used {usage['input_tokens'] + usage['output_tokens']} tokens (cached={usage.get('cached_tokens',0)}, total so far: {state['metrics']['total_tokens']})")
+
+            content = content or "{}"
             try:
                 result = json.loads(content)
                 

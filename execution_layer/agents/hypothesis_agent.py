@@ -7,12 +7,11 @@ import base64
 from typing import List, Dict, Any
 from pathlib import Path
 
-from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from langchain_core.runnables import Runnable
 from agents.executor import CodeAgent
 from agents.analysis_mode import normalize_analysis_mode, hypothesis_task_count
-from agents.llm_client import ENFORCED_MODEL, vision_image_mime_subtype
+from agents.llm_client import ENFORCED_MODEL, vision_image_mime_subtype, get_async_client, get_model, llm_call
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -146,8 +145,8 @@ Use simple language that non-technical stakeholders can understand."""
 
 class HypothesisAgent(Runnable):
     def __init__(self, output_dir):
-        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = (os.getenv("MODEL_NAME") or ENFORCED_MODEL).strip() or ENFORCED_MODEL
+        self.client = get_async_client()
+        self.model = get_model()
         self.output_dir = Path(output_dir)  # Convert to Path object
         print("output_dir in HypothesisAgent", self.output_dir)
         # Lazily created. Creating a new CodeAgent repeatedly is slow and leaks kernels.
@@ -202,31 +201,24 @@ class HypothesisAgent(Runnable):
 # - EDA Files(curated by eda agent and saved in output_data/eda directory): {eda_files}
         
         try:
-            response = await self.client.responses.create(
-                model=self.model,
-                input=[
+            content, usage = await llm_call(
+                messages=[
                     {"role": "system", "content": HYPOTHESIS_COMMAND_GENERATION_PROMPT},
-                    {"role": "user", "content": command_context}
+                    {"role": "user", "content": command_context},
                 ],
-                text={"format": {"type": "json_object"}},
-                max_output_tokens=400
+                max_output_tokens=400,
+                json_response=True,
+                seed=42,
             )
 
             # Update metrics in state
-            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
-            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
-            state["metrics"]["total_tokens"] += (
-                getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
-            )
+            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+            state["metrics"]["completion_tokens"] += usage["output_tokens"]
+            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
             state["metrics"]["successful_requests"] += 1
+            state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
 
-            content = getattr(response, "output_text", None)
-            if not content:
-                try:
-                    content = response.output[0].content[0].text
-                except Exception:
-                    content = "{}"
-            
+            content = content or "{}"
             try:
                 result = json.loads(content)
                 
@@ -362,31 +354,24 @@ class HypothesisAgent(Runnable):
         """
 
         try:
-            response = await self.client.responses.create(
-                model=self.model,
-                input=[
+            content, usage = await llm_call(
+                messages=[
                     {"role": "system", "content": HYPOTHESIS_GENERATION_PROMPT},
-                    {"role": "user", "content": eda_context}
+                    {"role": "user", "content": eda_context},
                 ],
-                text={"format": {"type": "json_object"}},
-                max_output_tokens=800
+                max_output_tokens=800,
+                json_response=True,
+                seed=42,
             )
 
             # Update metrics in state
-            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
-            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
-            state["metrics"]["total_tokens"] += (
-                getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
-            )
+            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+            state["metrics"]["completion_tokens"] += usage["output_tokens"]
+            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
             state["metrics"]["successful_requests"] += 1
-            
-            content = getattr(response, "output_text", None)
-            if not content:
-                try:
-                    content = response.output[0].content[0].text
-                except Exception:
-                    content = "{}"
-            
+            state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
+
+            content = content or "{}"
             try:
                 result = json.loads(content)
                 
@@ -531,31 +516,24 @@ Make sure visualizations clearly show whether the hypothesis is supported or rej
             )
 
             try:
-                response = await self.client.responses.create(
-                    model=self.model,
-                    input=[
+                content, usage = await llm_call(
+                    messages=[
                         {"role": "system", "content": STEP_PROMPT},
                         {"role": "user", "content": user_msg},
                     ],
-                    text={"format": {"type": "json_object"}},
                     max_output_tokens=600,
+                    json_response=True,
+                    seed=42,
                 )
 
-                if hasattr(response, "usage") and isinstance(state.get("metrics"), dict):
-                    state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
-                    state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
-                    state["metrics"]["total_tokens"] += (
-                        getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
-                    )
+                if isinstance(state.get("metrics"), dict):
+                    state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+                    state["metrics"]["completion_tokens"] += usage["output_tokens"]
+                    state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
                     state["metrics"]["successful_requests"] += 1
+                    state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
 
-                content = getattr(response, "output_text", None)
-                if not content:
-                    try:
-                        content = response.output[0].content[0].text
-                    except Exception:
-                        content = "{}"
-
+                content = content or "{}"
                 parsed = _json.loads(content)
                 finding = parsed.get("finding")
                 synthesis_text = parsed.get("synthesis", "")
@@ -621,29 +599,23 @@ Make sure visualizations clearly show whether the hypothesis is supported or rej
         )
 
         try:
-            response = await self.client.responses.create(
-                model=self.model,
-                input=[
+            content, usage = await llm_call(
+                messages=[
                     {"role": "system", "content": BATCH_PROMPT},
                     {"role": "user", "content": combined},
                 ],
-                text={"format": {"type": "json_object"}},
                 max_output_tokens=4000,
+                json_response=True,
+                seed=42,
             )
-            if hasattr(response, "usage") and isinstance(state.get("metrics"), dict):
-                state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
-                state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
-                state["metrics"]["total_tokens"] += (
-                    getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
-                )
+            if isinstance(state.get("metrics"), dict):
+                state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+                state["metrics"]["completion_tokens"] += usage["output_tokens"]
+                state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
                 state["metrics"]["successful_requests"] += 1
+                state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
 
-            content = getattr(response, "output_text", None)
-            if not content:
-                try:
-                    content = response.output[0].content[0].text
-                except Exception:
-                    content = "{}"
+            content = content or "{}"
             parsed = _json.loads(content)
             findings = parsed.get("findings")
             synthesis = (parsed.get("synthesis") or "").strip()
@@ -777,9 +749,8 @@ Make sure visualizations clearly show whether the hypothesis is supported or rej
 
     Provide detailed analysis of what this chart shows and how it relates to testing the hypothesis.
     """
-                    vision_response = await self.client.responses.create(
-                        model=self.model,
-                        input=[
+                    analysis_text, usage = await llm_call(
+                        messages=[
                             {"role": "system", "content": VISION_ANALYSIS_PROMPT},
                             {
                                 "role": "user",
@@ -793,21 +764,15 @@ Make sure visualizations clearly show whether the hypothesis is supported or rej
                             },
                         ],
                         max_output_tokens=600,
+                        seed=42,
                     )
-                    if hasattr(vision_response, "usage") and isinstance(state.get("metrics"), dict):
-                        state["metrics"]["prompt_tokens"] += getattr(vision_response.usage, "input_tokens", 0)
-                        state["metrics"]["completion_tokens"] += getattr(vision_response.usage, "output_tokens", 0)
-                        state["metrics"]["total_tokens"] += (
-                            getattr(vision_response.usage, "input_tokens", 0)
-                            + getattr(vision_response.usage, "output_tokens", 0)
-                        )
+                    if isinstance(state.get("metrics"), dict):
+                        state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+                        state["metrics"]["completion_tokens"] += usage["output_tokens"]
+                        state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
                         state["metrics"]["successful_requests"] += 1
-                    analysis_text = getattr(vision_response, "output_text", None)
-                    if not analysis_text:
-                        try:
-                            analysis_text = vision_response.output[0].content[0].text
-                        except Exception:
-                            analysis_text = ""
+                        state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
+                    analysis_text = analysis_text or ""
                     return {"img": Path(img_path).name, "description": analysis_text or ""}
                 except Exception as e:
                     logger.error(f"Error analyzing image {img_path}: {e}")
@@ -845,30 +810,23 @@ Make sure visualizations clearly show whether the hypothesis is supported or rej
     """
         
         try:
-            judgment_response = await self.client.responses.create(
-                model=self.model,
-                input=[
+            content, usage = await llm_call(
+                messages=[
                     {"role": "system", "content": HYPOTHESIS_JUDGMENT_PROMPT},
-                    {"role": "user", "content": judgment_context}
+                    {"role": "user", "content": judgment_context},
                 ],
-                max_output_tokens=1000
+                max_output_tokens=1000,
+                seed=42,
             )
-            
-            # Update metrics in state
-            state["metrics"]["prompt_tokens"] += getattr(judgment_response.usage, "input_tokens", 0)
-            state["metrics"]["completion_tokens"] += getattr(judgment_response.usage, "output_tokens", 0)
-            state["metrics"]["total_tokens"] += (
-                getattr(judgment_response.usage, "input_tokens", 0) + getattr(judgment_response.usage, "output_tokens", 0)
-            )
-            state["metrics"]["successful_requests"] += 1
 
-            content = getattr(judgment_response, "output_text", None)
-            if not content:
-                try:
-                    content = judgment_response.output[0].content[0].text
-                except Exception:
-                    content = ""
-            return content
+            # Update metrics in state
+            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+            state["metrics"]["completion_tokens"] += usage["output_tokens"]
+            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+            state["metrics"]["successful_requests"] += 1
+            state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
+
+            return content or ""
             
         except Exception as e:
             logger.error(f"Error creating final judgment for hypothesis {hypothesis_id}: {e}")

@@ -7,7 +7,6 @@ import base64
 import mimetypes
 from typing import Dict, Any, List
 from pathlib import Path
-from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from langchain_core.runnables import Runnable
 from bs4 import BeautifulSoup
@@ -23,7 +22,7 @@ from agents.analysis_mode import (
     skip_hypothesis,
 )
 from agents.token_manager import check_token_limit_internal, complete_job_gracefully, TokenLimitExceededException
-from agents.llm_client import ENFORCED_MODEL
+from agents.llm_client import ENFORCED_MODEL, get_async_client, get_model, llm_call
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -39,16 +38,16 @@ def convert_images_to_base64_for_report(*, html_content: str, output_dir: str | 
     out_dir = Path(output_dir) if output_dir else None
     script_dir = Path(__file__).resolve().parent
 
-    # Build a basename->path map from output_dir for fallback resolution
+    # Build a basename->path map from output_dir for fallback resolution.
+    # Use rglob so images saved in subdirectories (e.g. hypothesis/) are also found.
     available_images: Dict[str, Path] = {}
     if out_dir and out_dir.exists():
         for ext in ("*.png", "*.jpg", "*.jpeg", "*.svg", "*.gif", "*.webp"):
-            for p in out_dir.glob(ext):
-                available_images[p.name.lower()] = p
-        img_utils = out_dir / "image_utils"
-        if img_utils.exists():
-            for p in img_utils.rglob("*.png"):
-                available_images[p.name.lower()] = p
+            for p in out_dir.rglob(ext):
+                # Only overwrite if not already seen — top-level files take priority
+                # over deeper duplicates since the LLM uses bare filenames.
+                if p.name.lower() not in available_images:
+                    available_images[p.name.lower()] = p
 
     for img_tag in soup.find_all("img"):
         src = (img_tag.get("src") or "").strip()
@@ -179,25 +178,27 @@ def build_pseudonymized_columns_map(domain_directory: dict) -> Dict[str, List[st
         out[str(ds_name)] = cleaned
     return out
 
-def create_query_analysis_prompt(domain_directory: dict) -> str:
-    """Create query analysis prompt with dynamic domain directory"""
-    return f"""You are an expert query analyst who understands user queries and have domain knowledge.
-Domain Directory: {domain_directory}
+# ---------------------------------------------------------------------------
+# Static system prompt — eligible for prefix caching on every call.
+# The domain_directory (per-job data) is passed in the user message instead
+# so this string stays identical across all jobs and can be cached.
+# ---------------------------------------------------------------------------
+QUERY_ANALYSIS_SYSTEM_PROMPT = """You are an expert query analyst who understands user queries and have domain knowledge.
 
 IMPORTANT: You must provide detailed business-focused thinking logs throughout your analysis process so users can see your business reasoning and decision-making process. Think like a business analyst, not a technical analyst.
 
 Step-by-step business analysis process with thinking logs:
-Step 1: Analyze the user query and use your domain knowledge to determine the intent(What user wants)
-Step 2: **CRITICAL - RELEVANCY CHECK**: Carefully examine the Domain Directory above to determine if the available datasets contain the necessary columns, dimensions, and facts to answer this query. Check:
+Step 1: Analyze the user query and use your domain knowledge and the Domain Directory provided in the user message to determine the intent (What user wants)
+Step 2: **CRITICAL - RELEVANCY CHECK**: Carefully examine the Domain Directory provided to determine if the available datasets contain the necessary columns, dimensions, and facts to answer this query. Check:
    - Are the required data fields/columns present in any of the datasets?
    - Does the domain context match what the user is asking about?
    - Can the query be answered with the available data, even partially?
 Step 3: If query IS supportable - break down the complex query into sub queries
 Step 4: Determine the brief and exact plan to solve the sub queries(include required dimensions and facts)
-Step 5: Determine the appropriate output like types of graphs, charts, tables, etc. 
+Step 5: Determine the appropriate output like types of graphs, charts, tables, etc.
 
 Response format (JSON):
-{{
+{
     "thinking_logs": [
         "💼 Understanding business question and stakeholder needs...",
         "🔍 Checking data availability: [examining domain directory for required fields]",
@@ -211,9 +212,9 @@ Response format (JSON):
     "unsupported_reason": "Only provide if is_supportable is false. Give a clear, user-friendly explanation of why this query cannot be answered with the available data. Mention what data would be needed and suggest alternative questions that CAN be answered with the current datasets.",
     "user_intent": "brief description of what user wants",
     "sub_queries": "list of sub queries (empty array if not supportable)",
-    "plan": "brief plan to solve the sub queries (empty array if not supportable) [{{"sub_query1":"plan1", "sub_query2":"plan2",...}}]",
+    "plan": "brief plan to solve the sub queries (empty array if not supportable) [{"sub_query1":"plan1", "sub_query2":"plan2",...}]",
     "expected_output": "list of output and it's brief description of expected output (empty array if not supportable)"
-}}
+}
 
 CRITICAL RULES FOR RELEVANCY CHECK:
 1. If is_supportable is FALSE, you MUST provide a helpful unsupported_reason that:
@@ -227,8 +228,8 @@ CRITICAL RULES FOR RELEVANCY CHECK:
 
 class DataAnalysisAgent(Runnable):
     def __init__(self, output_dir):
-        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = (os.getenv("MODEL_NAME") or ENFORCED_MODEL).strip() or ENFORCED_MODEL
+        self.client = get_async_client()
+        self.model = get_model()
         self.output_dir = output_dir
         print("output_dir in DataAnalysisAgent", self.output_dir)
 
@@ -243,10 +244,7 @@ class DataAnalysisAgent(Runnable):
             
             print(f"🔧 [DATA ANALYSIS AGENT] Using input dir: {input_dir}")
             print(f"📁 [DATA ANALYSIS AGENT] Domain directory loaded: {len(domain_directory)} entries")
-            
-            # Create dynamic prompt with job-specific domain directory
-            query_analysis_prompt = create_query_analysis_prompt(domain_directory)
-            
+
             # Check token limit internally before making LLM call (MULTI-USER SAFE)
             can_proceed, token_message, should_complete = check_token_limit_internal(state, estimated_tokens=800)
             
@@ -262,37 +260,33 @@ class DataAnalysisAgent(Runnable):
                     raise TokenLimitExceededException(token_message)
             
             print(f"📊 [DATA_ANALYSIS_AGENT] {token_message}")
-            
-            response = await self.client.responses.create(
-                model=self.model,
-                input=[
-                    {"role": "system", "content": query_analysis_prompt},
-                    {"role": "user", "content": f"User query: {user_query}"}
+
+            # domain_directory is dynamic (per-job) — placed in the user message so
+            # the static QUERY_ANALYSIS_SYSTEM_PROMPT can be prefix-cached.
+            user_content = (
+                f"Domain Directory: {domain_directory}\n\n"
+                f"User query: {user_query}"
+            )
+
+            content, usage = await llm_call(
+                messages=[
+                    {"role": "system", "content": QUERY_ANALYSIS_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
                 ],
-                text={"format": {"type": "json_object"}},
                 max_output_tokens=1100,
+                json_response=True,
+                seed=42,
             )
-            
+
             # Update metrics in state
-            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
-            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
-            state["metrics"]["total_tokens"] += (
-                getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
-            )
+            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+            state["metrics"]["completion_tokens"] += usage["output_tokens"]
+            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
             state["metrics"]["successful_requests"] += 1
-            
-            # Log token usage for this call
-            if hasattr(response, "usage") and response.usage:
-                tokens_used = getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
-                print(f"📊 [DATA_ANALYSIS_AGENT] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
-            
-            content = getattr(response, "output_text", None)
-            if not content:
-                try:
-                    content = response.output[0].content[0].text
-                except Exception:
-                    content = "{}"
-            
+            state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
+            print(f"📊 [DATA_ANALYSIS_AGENT] Used {usage['input_tokens'] + usage['output_tokens']} tokens (cached={usage.get('cached_tokens',0)}, total so far: {state['metrics']['total_tokens']})")
+
+            content = content or "{}"
             result = json.loads(content)
             
             # Stream LLM thinking logs via progress_callback

@@ -9,7 +9,6 @@ from typing import List, Dict, Any
 from pathlib import Path
 import datetime as dt
 
-from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from langchain_core.runnables import Runnable
 
@@ -18,12 +17,35 @@ from bs4 import BeautifulSoup
 from agents.executor import CodeAgent
 from agents.token_manager import check_token_limit_internal, complete_job_gracefully, TokenLimitExceededException
 from agents.analysis_mode import DEFAULT_ANALYSIS_MODE
-from agents.llm_client import ENFORCED_MODEL, vision_image_mime_subtype
+from agents.llm_client import ENFORCED_MODEL, vision_image_mime_subtype, get_async_client, get_model, llm_call
 from agents.perf_utils import log_resources
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Static system prompt — eligible for prefix caching on every call.
+# ---------------------------------------------------------------------------
+_FRAME_PROMPT = (
+    "You are a senior strategy consultant preparing a final executive report.\n"
+    "Inputs: user query, hypothesis summary & findings, EDA summary, and a list of all files.\n"
+    "You will also receive report_verbosity ('concise' or 'full').\n"
+    "Tasks:\n"
+    "1. Write a concise narrative frame that sets the story.\n"
+    "2. Select files that best support the report.\n"
+    "   - If report_verbosity is 'concise', select at most 5 files and prioritize CSV/TXT summaries.\n"
+    "   - If report_verbosity is 'full', select up to 10 files; you MUST include all relevant\n"
+    "     PNG/JPG/JPEG chart files from the list — charts are required for the executive report.\n"
+    "     Prioritize image files first, then CSV/TXT summaries to fill remaining slots.\n"
+    "\n"
+    "CRITICAL RELIABILITY RULES:\n"
+    "- You MUST select files ONLY from the provided all_files list.\n"
+    "- selected_files MUST be an exact subset of all_files (exact string match). Do NOT invent paths.\n"
+    "- If no files are relevant, return selected_files as an empty list.\n"
+    "Return JSON: { 'frame_text': str, 'selected_files': [paths] }"
+)
 
 
 def _looks_like_raw_synthesis_json(s: str) -> bool:
@@ -96,6 +118,90 @@ def _ensure_doctype_html_wrapper(html_src: str) -> str:
         return f"<!DOCTYPE html>\n<html lang=\"en\">\n{ch}\n</html>"
     return html_src
 
+
+# Phrases the model sometimes adds when slim/table-only runs produce no PNGs.
+_CHART_DISCLAIMER_RE = re.compile(
+    r"(no\s+charts?\s+were\s+available|charts?\s+were\s+not\s+available|no\s+plots?\s+were\s+available"
+    r"|no\s+visuali[sz]ations?\s+were\s+available|visuali[sz]ations?\s+were\s+not\s+available"
+    r"|no\s+charts?\s+in\s+the\s+analysis|charts?\s+were\s+not\s+included)",
+    re.IGNORECASE,
+)
+
+# Trailing "Note: … file1.csv … file2.csv …" style blocks (not wanted in executive HTML).
+_ARTIFACT_FOOTER_RE = re.compile(
+    r"(?is)^(note|source|sources?|artifacts?|files?\s+used|referenced\s+files?)\b[:.\s-]*"
+    r".*(\.(?:csv|txt|json|parquet)\b).+(\.(?:csv|txt|json|parquet)\b)",
+)
+
+# Internal / JSON field jargon that should never appear in reader-facing HTML (post-process only).
+_READER_CONFUSING_PROVENANCE_RE = re.compile(
+    r"\b("
+    r"eda\s+summary|exploratory\s+data\s+analysis\s+summary|"
+    r"hypothesis\s+agent|narrator\s+agent|execution\s+layer|"
+    r"hypothesis_findings|eda_summary|file_analyses|frame_text|"
+    r"\bagents?\b.*\b(notes?|outputs?|saved|storing)|"
+    r"artifacts?\s+(provided|saved|stored|written)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Meta paragraphs about label spelling across pipeline outputs (normalize silently instead).
+_INTERNAL_LABEL_META_RE = re.compile(
+    r"(naming\s+inconsisten|variations\s+like|versus\s+\w+\s+versus|"
+    r"standard\s+category\s+naming|future\s+reporting\s+workflows?)",
+    re.IGNORECASE,
+)
+
+
+def _strip_meta_disclaimers_from_report_html(html_src: str) -> str:
+    """
+    Remove LLM-added asides about missing charts, bare filename footers, internal
+    provenance phrasing, and chrome that confuses non-technical readers. Prompts
+    stay unchanged; this runs on final HTML only.
+    """
+    if not html_src or "<" not in html_src:
+        return html_src
+    try:
+        soup = BeautifulSoup(html_src, "html.parser")
+        # Strip executive kicker chrome (not part of reader UX).
+        for tag in list(soup.find_all(True)):
+            classes = tag.get("class") or []
+            if isinstance(classes, str):
+                classes = [classes]
+            if "report-kicker" in classes:
+                tag.decompose()
+                continue
+            if tag.name in ("div", "span", "p") and len(tag.get_text(strip=True)) < 48:
+                if tag.get_text(strip=True).lower() == "executive report":
+                    tag.decompose()
+
+        for tag in list(soup.find_all(["p", "div", "small", "span", "li", "em", "aside", "footer", "font"])):
+            t = tag.get_text(" ", strip=True)
+            if not t or len(t) > 900:
+                continue
+            nested = len(tag.find_all(recursive=True))
+            if nested > 12:
+                continue
+            if _CHART_DISCLAIMER_RE.search(t):
+                tag.decompose()
+                continue
+            if len(t) < 700 and _ARTIFACT_FOOTER_RE.search(t):
+                tag.decompose()
+                continue
+            if len(t) < 900 and _READER_CONFUSING_PROVENANCE_RE.search(t):
+                tag.decompose()
+                continue
+            if len(t) < 900 and _INTERNAL_LABEL_META_RE.search(t) and (
+                "xl" in t.lower()
+                or "ebike" in t.lower()
+                or "uber" in t.lower()
+                or "bike" in t.lower()
+            ):
+                tag.decompose()
+        return str(soup)
+    except Exception:
+        return html_src
+
 # Updated Vision Analysis Prompt for better business context
 VISION_ANALYSIS_PROMPT = """You are a senior management consultant responsible for analyzing data visualizations for executive presentations.
 
@@ -162,7 +268,12 @@ FINAL_SYNTHESIS_PROMPT = """You are creating a McKinsey-style executive report t
     - Professional HTML with McKinsey-style CSS
     - Responsive design with clean layout
     - HTML tables for data summaries
-    - Image references: use ONLY the filename (e.g. correlation_heatmap.png) in img src, not full paths. Example: <img src="correlation_heatmap.png" alt="Correlation heatmap: ..." />
+    - Image references: the input JSON contains an `available_image_filenames` list — these are the
+      EXACT filenames of charts saved on disk. For every image in that list whose analysis shows
+      `"selection": "include"`, you MUST embed it in the report using ONLY the bare filename in
+      the img src (e.g. <img src='correlation_heatmap.png' alt='...' />). Do NOT invent filenames
+      that are not in `available_image_filenames`. If `available_image_filenames` is empty, present
+      findings as a table-only report without mentioning absent charts.
     - Provide currency formatting (include currency symbol based on the data e.g. INR:₹, USD:$, etc.)
     - Interactive elements where appropriate(tables should not be scrollable both horizontally and vertically, fit the table to the page layout)
     - First header should be the Question and the Date,use original_query and current_date
@@ -221,12 +332,19 @@ FINAL_SYNTHESIS_PROMPT = """You are creating a McKinsey-style executive report t
     Do not mention McKinsey in the report.
     Make sure to include 4-6 detailed thinking_logs that show your actual reasoning process.
 
+    **Output hygiene (mandatory):**
+    - Never apologize or add asides about missing charts, plots, or visualizations (e.g. do not write
+      "No charts were available", "charts were not generated", or similar **Note:** lines).
+      Table-only analysis is normal; present findings without mentioning absent images.
+    - Do not end the report with a small-print block that only lists source filenames or artifact paths.
+      If you cite a file, do it briefly inside normal narrative prose, not as a standalone catalog.
+
 """
 
 class NarratorAgent(Runnable):
     def __init__(self, output_dir):
-        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = (os.getenv("MODEL_NAME") or ENFORCED_MODEL).strip() or ENFORCED_MODEL
+        self.client = get_async_client()
+        self.model = get_model()
         self.output_dir = output_dir or os.path.join('execution_layer', 'output_data')
         # Ensure narrator output directory exists
         self.narrator_dir = Path(self.output_dir) / "narrator"
@@ -385,9 +503,8 @@ class NarratorAgent(Runnable):
             
             print(f"📊 [NARRATOR_AGENT] {token_message}")
             
-            response = await self.client.responses.create(
-                model=self.model,
-                input=[
+            content, usage = await llm_call(
+                messages=[
                     {"role": "system", "content": VISION_ANALYSIS_PROMPT},
                     {
                         "role": "user",
@@ -400,28 +517,20 @@ class NarratorAgent(Runnable):
                         ]
                     }
                 ],
-                max_output_tokens=800
+                max_output_tokens=800,
+                seed=42,
             )
-            
-            # Update metrics in state
-            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0) if hasattr(response, "usage") else 0
-            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0) if hasattr(response, "usage") else 0
-            state["metrics"]["total_tokens"] += (
-                (getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)) if hasattr(response, "usage") else 0
-            )
-            state["metrics"]["successful_requests"] += 1
 
-            # Log token usage for this call
-            if hasattr(response, "usage") and response.usage:
-                tokens_used = getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
-                print(f"📊 [NARRATOR_AGENT] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
-            
-            content = getattr(response, "output_text", None)
-            if not content:
-                try:
-                    content = response.output[0].content[0].text
-                except Exception:
-                    content = ""
+            # Update metrics in state
+            if isinstance(state.get("metrics"), dict):
+                state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+                state["metrics"]["completion_tokens"] += usage["output_tokens"]
+                state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
+                state["metrics"]["successful_requests"] += 1
+                state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
+                print(f"📊 [NARRATOR_AGENT] Used {usage['input_tokens'] + usage['output_tokens']} tokens (cached={usage.get('cached_tokens',0)}, total so far: {state['metrics']['total_tokens']})")
+
+            content = content or ""
             
             # Try to parse JSON response
             try:
@@ -532,21 +641,6 @@ class NarratorAgent(Runnable):
         """LLM call to draft narrative frame & choose up to 10 key files."""
         milestone_cb = state.get("milestone_callback", lambda *a, **k: None)
         milestone_cb("Narrator: Building report frame prompt", "narrator_frame_prompt_build", {"dependency": "sequential", "is_llm_call": False})
-        FRAME_PROMPT = (
-            "You are a senior strategy consultant preparing a final executive report.\n"
-            "Inputs: user query, hypothesis summary & findings, EDA summary, and a list of all files.\n"
-            "You will also receive report_verbosity ('concise' or 'full').\n"
-            "Tasks:\n"
-            "1. Write a concise narrative frame that sets the story.\n"
-            "2. Select files that best support the report.\n"
-            "   - If report_verbosity is 'concise', select at most 5 files and prioritize CSV/TXT summaries.\n"
-            "   - If report_verbosity is 'full', select up to 10 files.\n"
-            "\n"
-            "CRITICAL RELIABILITY RULES:\n"
-            "- You MUST select files ONLY from the provided all_files list.\n"
-            "- selected_files MUST be an exact subset of all_files (exact string match). Do NOT invent paths.\n"
-            "- If no files are relevant, return selected_files as an empty list.\n"
-            "Return JSON: { 'frame_text': str, 'selected_files': [paths] }" )
 
         payload = {
             "original_query": state.get("original_query", ""),
@@ -575,34 +669,26 @@ class NarratorAgent(Runnable):
             print(f"📊 [NARRATOR_AGENT] {token_message}")
             
             _frame_cap = 1200 if state.get("narrator_verbosity") == "concise" else 1600
-            response = await self.client.responses.create(
-                model=self.model,
-                input=[
-                    {"role": "system", "content": FRAME_PROMPT},
-                    {"role": "user", "content": json.dumps(payload, indent=2)}
+            content, usage = await llm_call(
+                messages=[
+                    {"role": "system", "content": _FRAME_PROMPT},
+                    {"role": "user", "content": json.dumps(payload, indent=2)},
                 ],
-                text={"format": {"type": "json_object"}},
                 max_output_tokens=_frame_cap,
+                json_response=True,
+                seed=42,
             )
 
-            if hasattr(response, "usage") and isinstance(state.get("metrics"), dict):
+            if isinstance(state.get("metrics"), dict):
                 m = state["metrics"]
-                m["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
-                m["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
-                m["total_tokens"] += getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+                m["prompt_tokens"] += usage["input_tokens"]
+                m["completion_tokens"] += usage["output_tokens"]
+                m["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
                 m["successful_requests"] += 1
+                m["cached_tokens"] += usage.get("cached_tokens", 0)
+                print(f"📊 [NARRATOR_AGENT] Used {usage['input_tokens'] + usage['output_tokens']} tokens (cached={usage.get('cached_tokens',0)}, total so far: {m['total_tokens']})")
 
-            # Log token usage for this call
-            if hasattr(response, "usage") and response.usage:
-                tokens_used = getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
-                print(f"📊 [NARRATOR_AGENT] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
-
-            content = getattr(response, "output_text", None)
-            if not content:
-                try:
-                    content = response.output[0].content[0].text
-                except Exception:
-                    content = "{}"
+            content = content or "{}"
             milestone_cb("Narrator: LLM report frame done", "narrator_frame_llm_done", {"dependency": "sequential", "is_llm_call": True})
             return json.loads(content)
         except Exception as e:
@@ -721,6 +807,15 @@ class NarratorAgent(Runnable):
     async def _generate_final_html(self, state: dict, frame_text: str, file_analyses: List[Dict[str, Any]]) -> str:
         """Use FINAL_SYNTHESIS_PROMPT to create McKinsey-style HTML."""
         milestone_cb = state.get("milestone_callback", lambda *a, **k: None)
+
+        # Extract the exact basenames of images that were selected and analyzed.
+        # Passing these explicitly prevents the LLM from hallucinating filenames.
+        available_image_filenames = [
+            Path(fa["file"]).name
+            for fa in file_analyses
+            if fa.get("type") == "image" and Path(fa["file"]).suffix.lower() in {".png", ".jpg", ".jpeg", ".svg"}
+        ]
+
         context = {
             "original_query": state.get("original_query", ""),
             "current_date": dt.datetime.now().strftime("%Y-%m-%d"),
@@ -728,6 +823,7 @@ class NarratorAgent(Runnable):
             "report_verbosity": state.get("narrator_verbosity", "full"),
             "frame_text": frame_text,
             "file_analyses": file_analyses,
+            "available_image_filenames": available_image_filenames,
             "hypothesis_summary": state.get("hypothesis_summary", ""),
             "hypothesis_findings": state.get("hypothesis_findings", []),
             "eda_summary": state.get("eda_summary", ""),
@@ -752,34 +848,26 @@ class NarratorAgent(Runnable):
             print(f"📊 [NARRATOR_AGENT] {token_message}")
             
             _html_cap = 5500 if state.get("narrator_verbosity") == "concise" else 9000
-            response = await self.client.responses.create(
-                model=self.model,
-                input=[
+            content, usage = await llm_call(
+                messages=[
                     {"role": "system", "content": FINAL_SYNTHESIS_PROMPT},
-                    {"role": "user", "content": json.dumps(context, indent=2)}
+                    {"role": "user", "content": json.dumps(context, indent=2)},
                 ],
-                text={"format": {"type": "json_object"}},
                 max_output_tokens=_html_cap,
+                json_response=True,
+                seed=42,
             )
 
-            if hasattr(response, "usage") and isinstance(state.get("metrics"), dict):
+            if isinstance(state.get("metrics"), dict):
                 m = state["metrics"]
-                m["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
-                m["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
-                m["total_tokens"] += getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
+                m["prompt_tokens"] += usage["input_tokens"]
+                m["completion_tokens"] += usage["output_tokens"]
+                m["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
                 m["successful_requests"] += 1
+                m["cached_tokens"] += usage.get("cached_tokens", 0)
+                print(f"📊 [NARRATOR_AGENT] Used {usage['input_tokens'] + usage['output_tokens']} tokens (cached={usage.get('cached_tokens',0)}, total so far: {m['total_tokens']})")
 
-            # Log token usage for this call
-            if hasattr(response, "usage") and response.usage:
-                tokens_used = getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
-                print(f"📊 [NARRATOR_AGENT] Used {tokens_used} tokens (Total so far: {state['metrics']['total_tokens']})")
-
-            content = getattr(response, "output_text", None)
-            if not content:
-                try:
-                    content = response.output[0].content[0].text
-                except Exception:
-                    content = "{}"
+            content = content or "{}"
             milestone_cb("Narrator: LLM final HTML done", "narrator_final_llm_done", {"dependency": "sequential", "is_llm_call": True})
             
             progress_callback = state.get("progress_callback", lambda *args, **kwargs: None)
@@ -813,6 +901,7 @@ class NarratorAgent(Runnable):
                 )
 
             out = _fix_mangled_quote_attrs(html_report)
+            out = _strip_meta_disclaimers_from_report_html(out)
             return _repair_viewport_meta(out)
         except Exception as e:
             logger.error(f"Error generating final HTML: {e}")
@@ -832,7 +921,8 @@ class NarratorAgent(Runnable):
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
                     "total_tokens": 0,
-                    "successful_requests": 0
+                    "successful_requests": 0,
+                    "cached_tokens": 0,
                 }
            
             # 1. Gather all files in output_data
@@ -889,6 +979,7 @@ class NarratorAgent(Runnable):
 
             if not _looks_like_raw_synthesis_json(clean_html):
                 clean_html = _ensure_doctype_html_wrapper(clean_html)
+            clean_html = _strip_meta_disclaimers_from_report_html(clean_html)
             milestone_cb("Narrator: Post-processing HTML", "narrator_final_html_complete", {"dependency": "sequential", "is_llm_call": False})
 
              # Convert images to base64

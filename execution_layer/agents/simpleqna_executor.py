@@ -4,15 +4,11 @@ import logging
 import asyncio
 import re
 import hashlib
-from pathlib import Path
-from typing import Dict
-
-import openai
 from dotenv import load_dotenv
 from langchain_core.runnables import Runnable
 
 from execution_layer.agents.coding_tool import JupyterExecutionTool
-from execution_layer.agents.llm_client import ENFORCED_MODEL
+from execution_layer.agents.llm_client import ENFORCED_MODEL, get_sync_client, get_model, apply_cache_control, llm_call
 
 # load .env
 load_dotenv()
@@ -118,18 +114,19 @@ def _load_domain_directory(input_dir: str = "/app/execution_layer/input_data") -
         return {}
 
 
-def _build_system_prompt(input_dir: str) -> str:
-    """Construct the system prompt per request using the live domain directory.
-    
-    NOTE: This prompt is intentionally kept SIMPLE and focused on DATA ACCURACY.
-    Unit formatting and presentation is handled separately in judge_answer() 
-    to avoid cognitive overload during code generation.
-    """
-    domain_directory = _load_domain_directory(input_dir)
-    return f"""You are a Python data science assistant.
+# ---------------------------------------------------------------------------
+# Static system prompt — eligible for prefix caching on every call.
+# The domain_directory (per-session data) is passed in the user message so
+# this string stays identical across all sessions and can be cached.
+#
+# NOTE: Intentionally kept SIMPLE and focused on DATA ACCURACY.
+# Unit formatting and presentation is handled separately in judge_answer()
+# to avoid cognitive overload during code generation.
+# ---------------------------------------------------------------------------
+_EXECUTOR_SYSTEM_PROMPT = """You are a Python data science assistant.
 Convert the user's request into executable Python code.
 Use the JSON list of previous runs (code + output) for context.
-also refer to this Domain Directory: {domain_directory}
+The Domain Directory describing available datasets is provided in the user message.
 
 IMPORTANT RULES:
 - Only return valid Python code
@@ -157,6 +154,17 @@ CRITICAL ERROR HANDLING:
 - If you see "ModuleNotFoundError" for a module, use os.system('pip install <module>') to install it
 - For missing files or directories, first verify existence with os.path.exists('/app/execution_layer/input_data') and list with os.listdir('/app/execution_layer/input_data'). Never assume relative paths.
 """
+
+
+def _build_system_prompt(input_dir: str) -> str:
+    """
+    DEPRECATED — kept only as a compatibility shim.
+    Returns (_EXECUTOR_SYSTEM_PROMPT, domain_directory_dict).
+    Direct callers should use _EXECUTOR_SYSTEM_PROMPT and inject the domain
+    directory into the user message for prefix caching.
+    """
+    domain_directory = _load_domain_directory(input_dir)
+    return _EXECUTOR_SYSTEM_PROMPT, domain_directory
 
 
 def _safe_df_var(dataset_name: str) -> str:
@@ -218,7 +226,7 @@ class CodeAgent(Runnable):
         # spin up a persistent Jupyter kernel
         self.executor = JupyterExecutionTool()
         self.max_retries = 3
-        self.model = (os.getenv("MODEL_NAME") or ENFORCED_MODEL).strip() or ENFORCED_MODEL
+        self.model = get_model()
         self._preloaded_key = None
         self._preloaded_vars: Dict[str, str] = {}
 
@@ -284,33 +292,37 @@ class CodeAgent(Runnable):
         - Never use relative 'input_data' or 'output_data' paths.
         """
         
-        client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        loop = asyncio.get_event_loop()
-        model = self.model
-        
         try:
-            system_prompt = _build_system_prompt(state.get("input_dir", "/app/execution_layer/input_data"))
-            resp = await loop.run_in_executor(
-                None,
-                lambda: client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "developer", "content": system_prompt},
-                        {"role": "user", "content": user_msg}
-                    ],
-                    temperature=0.1,
-                    max_tokens=2000
-                )
+            # Load domain directory — per-session data placed in the user message
+            # so the static _EXECUTOR_SYSTEM_PROMPT can be prefix-cached.
+            input_dir = state.get("input_dir", "/app/execution_layer/input_data")
+            domain_directory = _load_domain_directory(input_dir)
+
+            # Prepend domain directory to the user message (dynamic, not cached).
+            full_user_msg = (
+                f"Domain Directory: {json.dumps(domain_directory, ensure_ascii=False)}\n\n"
+                + user_msg
             )
-            
+
+            code, usage = await llm_call(
+                messages=[
+                    {"role": "developer", "content": _EXECUTOR_SYSTEM_PROMPT},
+                    {"role": "user", "content": full_user_msg},
+                ],
+                max_output_tokens=2000,
+                temperature=0.1,
+                seed=42,
+            )
+
             # Update metrics in state if available
             if state and "metrics" in state:
-                state["metrics"]["prompt_tokens"] += resp.usage.prompt_tokens
-                state["metrics"]["completion_tokens"] += resp.usage.completion_tokens
-                state["metrics"]["total_tokens"] += (resp.usage.prompt_tokens + resp.usage.completion_tokens)
+                state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+                state["metrics"]["completion_tokens"] += usage["output_tokens"]
+                state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
                 state["metrics"]["successful_requests"] += 1
-            
-            code = resp.choices[0].message.content
+                state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
+
+            code = code or ""
             
             # Clean up code formatting
             if code.startswith("```python"):

@@ -5,6 +5,10 @@ Supports both user ID formats:
 - Old: user_id = email (e.g. prathamesh.joshi@zingworks.co) -> userCollection/{email}
 - New: user_id = UUID (e.g. OAxdcjvJKwU0wbpQnVmc) -> userCollection/{uuid} with name, email inside
 
+Admin token APIs (v2 admin) update userCollection/{email}. Analysis uses UUID as user_id and
+increments used_token on userCollection/{uuid}. get_user_tokens merges balances from the
+email-keyed doc when the UUID doc lists a different email, so allocations are visible.
+
 Flow:
 - available = issued_token - used_token
 - Before process: check available >= required for process type
@@ -16,7 +20,7 @@ and keep used_token in Firestore.
 """
 
 import asyncio
-from typing import Dict, Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from v2.common.logger import add_log
 from v2.utils.env import init_env
@@ -47,6 +51,19 @@ def _get_req_tokens() -> Dict[str, int]:
     return out
 
 
+def _coerce_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _issued_used_from_doc(doc: Dict[str, Any]) -> Tuple[int, int]:
+    issued = _coerce_int(doc.get("issued_token") or doc.get("issued_tokens", 0))
+    used = _coerce_int(doc.get("used_token") or doc.get("used_tokens", 0))
+    return issued, used
+
+
 async def get_user_tokens(user_id: str) -> Optional[Dict[str, Any]]:
     """
     Fetch user token info from userCollection/{user_id}.
@@ -61,21 +78,23 @@ async def get_user_tokens(user_id: str) -> Optional[Dict[str, Any]]:
         from v2.common.gcp import GcpManager
         gcp = GcpManager._get_instance()
         fs = gcp._firestore_service
-        doc = await fs._get_document(USER_COLLECTION, str(user_id).strip())
+        uid_key = str(user_id).strip()
+        doc = await fs._get_document(USER_COLLECTION, uid_key)
         if not doc:
             add_log(f"[TokenService] User not found: {user_id}")
             return None
-        # Canonical: used_token, issued_token (singular). Read both for backward compat.
-        issued = doc.get("issued_token") or doc.get("issued_tokens", 0)
-        used = doc.get("used_token") or doc.get("used_tokens", 0)
-        try:
-            issued = int(issued)
-        except (TypeError, ValueError):
-            issued = 0
-        try:
-            used = int(used)
-        except (TypeError, ValueError):
-            used = 0
+        issued, used = _issued_used_from_doc(doc)
+        billing_email = (doc.get("email") or doc.get("emailId") or "").strip().lower()
+        if billing_email and "@" in billing_email and billing_email != uid_key.lower():
+            email_doc = await fs._get_document(USER_COLLECTION, billing_email)
+            if email_doc:
+                e_issued, e_used = _issued_used_from_doc(email_doc)
+                issued = max(issued, e_issued)
+                used = used + e_used
+                add_log(
+                    f"[TokenService] Merged userCollection/{billing_email} with "
+                    f"userCollection/{uid_key} for token view (issued={issued}, used={used})"
+                )
         available = max(0, issued - used)
         return {
             "issued_tokens": issued,

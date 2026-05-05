@@ -6,14 +6,13 @@ import re
 from pathlib import Path
 from typing import Dict, Any, List
 from pydantic import BaseModel
-from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from langchain_core.runnables import Runnable
 
 try:
-    from agents.llm_client import ENFORCED_MODEL
+    from agents.llm_client import ENFORCED_MODEL, get_async_client, get_model, llm_call
 except ImportError:
-    from execution_layer.agents.llm_client import ENFORCED_MODEL
+    from execution_layer.agents.llm_client import ENFORCED_MODEL, get_async_client, get_model, llm_call
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -76,46 +75,39 @@ try:
 except Exception as e:
     logger.warning(f"Error loading domain directory from {domain_directory_path}: {e}")
     
-def _build_query_analysis_prompt(input_dir: str) -> str:
-    """Build the query analysis prompt per request using the live domain directory."""
-    dd = {}
-    try:
-        path = Path(input_dir) / "domain_directory.json"
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                dd = json.load(f)
-                logger.info(f"Domain directory loaded for query analysis from {path}: {len(dd)} entries")
-        else:
-            logger.warning(f"Domain directory not found at {path} - continuing without domain knowledge")
-    except Exception as e:
-        logger.warning(f"Failed to load domain directory from {input_dir} for query analysis: {e} - continuing without domain knowledge")
-    return f"""You are an expert who understands user query and devises a plan to solve it.
-You have domain knowledge: {dd}
+# ---------------------------------------------------------------------------
+# Static system prompts — eligible for prefix caching on every call.
+# Per-request dynamic data (domain_directory, user query, result data) is
+# passed in the user message so these strings remain identical across calls.
+# ---------------------------------------------------------------------------
+
+_QNA_ANALYSIS_SYSTEM_PROMPT = """You are an expert who understands user query and devises a plan to solve it.
+You have access to a Domain Directory provided in the user message that describes the available datasets and their structure.
 
 Step-by-step process:
-Step 1: Analyze the user query with given domain knowledge to determine the intent(What user wants)
-Step 2: Use the intent and break down the complex query into small solvable sub queries(which can be solved by simple operations)
-Step 3: Determine the exact step by step plan to solve the sub queries in right order(steps to be taken and operations to be performed)
+Step 1: Analyze the user query with the Domain Directory provided to determine the intent (What user wants)
+Step 2: Use the intent and break down the complex query into small solvable sub queries (which can be solved by simple operations)
+Step 3: Determine the exact step by step plan to solve the sub queries in right order (steps to be taken and operations to be performed)
 Step 4: Determine the appropriate output for each sub query (like tables) and specify the final tabular result should be named result_df when applicable.
 
 Response format (JSON):
-{{
+{
     "plan": [
-        {{
+        {
             "id": "1",
             "sub_query": "sub query 1",
             "code_instructions": "code instructions for sub query 1",
             "expected_output": "expected output for sub query 1"
-        }},
-        {{
+        },
+        {
             "id": "2",
             "sub_query": "sub query 2",
             "code_instructions": "code instructions for sub query 2",
             "expected_output": "expected output for sub query 2"
-        }},
+        },
         ...
     ]
-}}
+}
 **Important**:
 - Include required dimensions and facts correctly so it will be easy to form an answer based on the output.
 - Assume datasets are preloaded as DataFrames named df_<dataset_name> (sanitized lowercase with underscores), e.g., Opportunity.pkl -> df_opportunity.
@@ -124,6 +116,65 @@ Response format (JSON):
 - In plan expected_output, include the expected columns of result_df.
 - Do not include any additional text or explanations outside the JSON object.
 """
+
+_JUDGE_CSV_SYSTEM_PROMPT = (
+    "You are a senior analyst. Generate an HTML CONTENT FRAGMENT (NOT a full page - NO <!DOCTYPE>, <html>, <head>, or <body> tags). "
+    "The HTML will be embedded within a parent page, so it must NOT override parent styles or layout. "
+    "CRITICAL CSS RULES: "
+    "1. All CSS must be inside a <style> tag with scoped classes prefixed with 'qna-response-' (e.g., 'qna-response-container', 'qna-response-table'). "
+    "2. Use ONLY CSS classes (NO inline styles except where absolutely necessary). "
+    "3. Do NOT use global selectors like 'body', 'html', 'div', 'table' without the 'qna-response-' prefix. "
+    "4. Keep styles scoped to avoid conflicts with parent page CSS. "
+    "5. Use a wrapper div with class 'qna-response-container' for all content. "
+    "TABLE LAYOUT RULES: "
+    "- Render tables in standard horizontal layout with readable columns. "
+    "- Do NOT rotate text or make it vertical (no 'writing-mode', 'transform: rotate', or similar). "
+    "- Do NOT use extreme word breaking such as 'word-break: break-all' or column widths that force one character per line. "
+    "- Prefer letting the table scroll horizontally inside a wrapper div with class 'qna-response-table-wrapper' using 'overflow-x: auto'. "
+    "- Use normal table semantics with <table>, <thead>, <tbody>, <tr>, <th>, and <td>; set 'table-layout: auto' and let columns size naturally. "
+    "FORMATTING RULES: "
+    "- IDENTIFIERS (columns with 'id', 'code', 'number', 'no', 'account' in name): NEVER add thousand separators, currency symbols, or any formatting. Keep as raw integers/strings (e.g., 21226 NOT 21,226). "
+    "- Currency: INR (₹) with Indian digit grouping and 0–2 decimals. "
+    "- Percentages: append %, scale values in [0,1] by 100, round to 1–2 decimals. "
+    "- Counts: integers with grouping, no unit. "
+    "- Dates: use YYYY-MM-DD. "
+    "Follow the Answer Rules strictly. Show a concise summary and ONE sample table. "
+    "Do NOT add any 'Download CSV' buttons or links; CSV download controls will be provided by the hosting application."
+)
+
+_JUDGE_TEXT_SYSTEM_PROMPT = (
+    "You are a senior analyst. Generate an HTML CONTENT FRAGMENT (NOT a full page - NO <!DOCTYPE>, <html>, <head>, or <body> tags). "
+    "The HTML will be embedded within a parent page, so it must NOT override parent styles or layout. "
+    "CRITICAL CSS RULES: "
+    "1. All CSS must be inside a <style> tag with scoped classes prefixed with 'qna-response-' (e.g., 'qna-response-container', 'qna-response-table'). "
+    "2. Use ONLY CSS classes (NO inline styles except where absolutely necessary). "
+    "3. Do NOT use global selectors like 'body', 'html', 'div', 'table' without the 'qna-response-' prefix. "
+    "4. Keep styles scoped to avoid conflicts with parent page CSS. "
+    "5. Use a wrapper div with class 'qna-response-container' for all content. "
+    "FORMATTING RULES: "
+    "IDENTIFIERS (columns with 'id', 'code', 'number', 'no', 'account' in name): NEVER add thousand separators or any formatting - keep as raw integers/strings (e.g., 21226 NOT 21,226). "
+    "Currency: INR (₹) with Indian digit grouping. Percentages: append % with proper scaling. Counts: integers with grouping. Dates: YYYY-MM-DD. "
+    "Follow the Answer Rules strictly. Prefer a single clean table or readable text."
+)
+
+
+def _build_query_analysis_prompt(input_dir: str) -> str:
+    """
+    DEPRECATED — kept only as a compatibility shim.
+    Returns (_QNA_ANALYSIS_SYSTEM_PROMPT, domain_directory_dict) now that the
+    domain directory has been moved to the user message for prefix caching.
+    Direct callers should use _QNA_ANALYSIS_SYSTEM_PROMPT + load the domain
+    directory separately and inject it into the user message.
+    """
+    dd = {}
+    try:
+        path = Path(input_dir) / "domain_directory.json"
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                dd = json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load domain directory from {input_dir}: {e}")
+    return _QNA_ANALYSIS_SYSTEM_PROMPT, dd
 
 
 def _safe_df_var(dataset_name: str) -> str:
@@ -214,8 +265,8 @@ Response format (JSON):
 
 class DataAnalysisAgent(Runnable):
     def __init__(self):
-        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = (os.getenv("MODEL_NAME") or ENFORCED_MODEL).strip() or ENFORCED_MODEL
+        self.client = get_async_client()
+        self.model = get_model()
         self.output_dir = EXEC_BASE_DIR / "output_data"
         self._code_agent = None
 
@@ -238,15 +289,30 @@ class DataAnalysisAgent(Runnable):
         """Analyze user query to determine analysis approach"""
         try:
             logger.info(f"Processing user query: {user_query}")
-            prompt = _build_query_analysis_prompt(state.get("input_dir", "/app/execution_layer/input_data"))
+            input_dir = state.get("input_dir", "/app/execution_layer/input_data")
             preloaded_df_vars = state.get("preloaded_df_vars", {})
-            response = await self.client.chat.completions.create(
-                model=self.model,
+
+            # Load domain directory — per-request dynamic data placed in user message
+            # so the static _QNA_ANALYSIS_SYSTEM_PROMPT can be prefix-cached.
+            dd = {}
+            try:
+                path = Path(input_dir) / "domain_directory.json"
+                if path.exists():
+                    with open(path, "r", encoding="utf-8") as f:
+                        dd = json.load(f)
+                    logger.info(f"Domain directory loaded for query analysis from {path}: {len(dd)} entries")
+                else:
+                    logger.warning(f"Domain directory not found at {path} - continuing without domain knowledge")
+            except Exception as e:
+                logger.warning(f"Failed to load domain directory from {input_dir}: {e} - continuing without domain knowledge")
+
+            content, usage = await llm_call(
                 messages=[
-                    {"role": "system", "content": prompt},
+                    {"role": "system", "content": _QNA_ANALYSIS_SYSTEM_PROMPT},
                     {
                         "role": "user",
                         "content": (
+                            f"Domain Directory: {json.dumps(dd, ensure_ascii=False)}\n\n"
                             f"User query: {user_query}\n"
                             f"Preloaded datasets (dataset -> dataframe var): {json.dumps(preloaded_df_vars, ensure_ascii=False)}\n"
                             "Generate tasks that directly use the preloaded dataframe variables and avoid re-loading datasets from disk in each task.\n"
@@ -254,20 +320,22 @@ class DataAnalysisAgent(Runnable):
                         ),
                     },
                 ],
-                response_format={"type": "json_object"},
+                max_output_tokens=1000,
+                json_response=True,
                 temperature=0.2,
-                max_tokens=1000
+                seed=42,
             )
-            
+
             # Update metrics in state
-            if state.get("metrics") is not None and getattr(response, "usage", None) is not None:
-                state["metrics"]["prompt_tokens"] += response.usage.prompt_tokens
-                state["metrics"]["completion_tokens"] += response.usage.completion_tokens
-                state["metrics"]["total_tokens"] += response.usage.total_tokens
+            if isinstance(state.get("metrics"), dict):
+                state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+                state["metrics"]["completion_tokens"] += usage["output_tokens"]
+                state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
                 state["metrics"]["successful_requests"] += 1
-            
-            content_text = response.choices[0].message.content
-            parsed = json.loads(content_text)
+                state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
+
+            content = content or "{}"
+            parsed = json.loads(content)
             return parsed
         except Exception as e:
             logger.error(f"Error analyzing user query: {e}")
@@ -367,30 +435,7 @@ class DataAnalysisAgent(Runnable):
                     rules_text = ""
 
                 # Let LLM build HTML content fragment with scoped CSS (NOT a full page)
-                summary_system = (
-                    "You are a senior analyst. Generate an HTML CONTENT FRAGMENT (NOT a full page - NO <!DOCTYPE>, <html>, <head>, or <body> tags). "
-                    "The HTML will be embedded within a parent page, so it must NOT override parent styles or layout. "
-                    "CRITICAL CSS RULES: "
-                    "1. All CSS must be inside a <style> tag with scoped classes prefixed with 'qna-response-' (e.g., 'qna-response-container', 'qna-response-table'). "
-                    "2. Use ONLY CSS classes (NO inline styles except where absolutely necessary). "
-                    "3. Do NOT use global selectors like 'body', 'html', 'div', 'table' without the 'qna-response-' prefix. "
-                    "4. Keep styles scoped to avoid conflicts with parent page CSS. "
-                    "5. Use a wrapper div with class 'qna-response-container' for all content. "
-                    "TABLE LAYOUT RULES: "
-                    "- Render tables in standard horizontal layout with readable columns. "
-                    "- Do NOT rotate text or make it vertical (no 'writing-mode', 'transform: rotate', or similar). "
-                    "- Do NOT use extreme word breaking such as 'word-break: break-all' or column widths that force one character per line. "
-                    "- Prefer letting the table scroll horizontally inside a wrapper div with class 'qna-response-table-wrapper' using 'overflow-x: auto'. "
-                    "- Use normal table semantics with <table>, <thead>, <tbody>, <tr>, <th>, and <td>; set 'table-layout: auto' and let columns size naturally. "
-                    "FORMATTING RULES: "
-                    "- IDENTIFIERS (columns with 'id', 'code', 'number', 'no', 'account' in name): NEVER add thousand separators, currency symbols, or any formatting. Keep as raw integers/strings (e.g., 21226 NOT 21,226). "
-                    "- Currency: INR (₹) with Indian digit grouping and 0–2 decimals. "
-                    "- Percentages: append %, scale values in [0,1] by 100, round to 1–2 decimals. "
-                    "- Counts: integers with grouping, no unit. "
-                    "- Dates: use YYYY-MM-DD. "
-                    "Follow the Answer Rules strictly. Show a concise summary and ONE sample table. "
-                    "Do NOT add any 'Download CSV' buttons or links; CSV download controls will be provided by the hosting application."
-                )
+                summary_system = _JUDGE_CSV_SYSTEM_PROMPT
                 summary_user = json.dumps({
                     "answer_rules": rules_text,
                     "original_query": state.get("original_query", ""),
@@ -399,16 +444,16 @@ class DataAnalysisAgent(Runnable):
                     "download_placeholder": placeholder,
                     "sample_table": {"headers": headers, "rows": rows}
                 })
-                resp = await self.client.chat.completions.create(
-                    model=self.model,
+                html_output, usage = await llm_call(
                     messages=[
-                        {"role": "system", "content": summary_system},
-                        {"role": "user", "content": summary_user}
+                        {"role": "system", "content": _JUDGE_CSV_SYSTEM_PROMPT},
+                        {"role": "user", "content": summary_user},
                     ],
+                    max_output_tokens=1200,
                     temperature=0.2,
-                    max_tokens=1200
+                    seed=42,
                 )
-                html_output = resp.choices[0].message.content.strip()
+                html_output = (html_output or "").strip()
                 try:
                     for var_name, b64 in (state.get("blob_vars") or {}).items():
                         token = f"${{{var_name}}}"
@@ -436,13 +481,12 @@ class DataAnalysisAgent(Runnable):
                     html_output = self._inject_missing_value_note(html_output, has_missing)
                 except Exception:
                     pass
-                if state.get("metrics") is not None and getattr(resp, "usage", None) is not None:
-                    state["metrics"]["prompt_tokens"] += resp.usage.prompt_tokens
-                    state["metrics"]["completion_tokens"] += resp.usage.completion_tokens
-                    state["metrics"]["total_tokens"] += (
-                        resp.usage.prompt_tokens + resp.usage.completion_tokens
-                    )
+                if isinstance(state.get("metrics"), dict):
+                    state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+                    state["metrics"]["completion_tokens"] += usage["output_tokens"]
+                    state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
                     state["metrics"]["successful_requests"] += 1
+                    state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
             except Exception as e:
                 html_output = f"<p>Saved file detected but preview failed: {str(e)}</p>"
         else:
@@ -466,36 +510,23 @@ class DataAnalysisAgent(Runnable):
             except Exception:
                 rules_text = ""
 
-            summary_system = (
-                "You are a senior analyst. Generate an HTML CONTENT FRAGMENT (NOT a full page - NO <!DOCTYPE>, <html>, <head>, or <body> tags). "
-                "The HTML will be embedded within a parent page, so it must NOT override parent styles or layout. "
-                "CRITICAL CSS RULES: "
-                "1. All CSS must be inside a <style> tag with scoped classes prefixed with 'qna-response-' (e.g., 'qna-response-container', 'qna-response-table'). "
-                "2. Use ONLY CSS classes (NO inline styles except where absolutely necessary). "
-                "3. Do NOT use global selectors like 'body', 'html', 'div', 'table' without the 'qna-response-' prefix. "
-                "4. Keep styles scoped to avoid conflicts with parent page CSS. "
-                "5. Use a wrapper div with class 'qna-response-container' for all content. "
-                "FORMATTING RULES: "
-                "IDENTIFIERS (columns with 'id', 'code', 'number', 'no', 'account' in name): NEVER add thousand separators or any formatting - keep as raw integers/strings (e.g., 21226 NOT 21,226). "
-                "Currency: INR (₹) with Indian digit grouping. Percentages: append % with proper scaling. Counts: integers with grouping. Dates: YYYY-MM-DD. "
-                "Follow the Answer Rules strictly. Prefer a single clean table or readable text."
-            )
+            summary_system = _JUDGE_TEXT_SYSTEM_PROMPT
             summary_user = json.dumps({
                 "answer_rules": rules_text,
                 "original_query": state.get("original_query", ""),
                 "result_type": "small_text",
                 "printed_text": safe
             })
-            resp = await self.client.chat.completions.create(
-                model=self.model,
+            html_output, usage = await llm_call(
                 messages=[
-                    {"role": "system", "content": summary_system},
-                    {"role": "user", "content": summary_user}
+                    {"role": "system", "content": _JUDGE_TEXT_SYSTEM_PROMPT},
+                    {"role": "user", "content": summary_user},
                 ],
+                max_output_tokens=1200,
                 temperature=0.2,
-                max_tokens=1200
+                seed=42,
             )
-            html_output = resp.choices[0].message.content.strip()
+            html_output = (html_output or "").strip()
             # Sanitize HTML to ensure it's a fragment, not a full page
             html_output = self._sanitize_html_fragment(html_output)
             # Inject a deterministic note when missing values are present
@@ -503,13 +534,12 @@ class DataAnalysisAgent(Runnable):
                 html_output = self._inject_missing_value_note(html_output, has_missing_small)
             except Exception:
                 pass
-            if state.get("metrics") is not None and getattr(resp, "usage", None) is not None:
-                state["metrics"]["prompt_tokens"] += resp.usage.prompt_tokens
-                state["metrics"]["completion_tokens"] += resp.usage.completion_tokens
-                state["metrics"]["total_tokens"] += (
-                    resp.usage.prompt_tokens + resp.usage.completion_tokens
-                )
+            if isinstance(state.get("metrics"), dict):
+                state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+                state["metrics"]["completion_tokens"] += usage["output_tokens"]
+                state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
                 state["metrics"]["successful_requests"] += 1
+                state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
 
         # Persist - use job-specific output directory from state
         try:

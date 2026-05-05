@@ -32,7 +32,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import analysis components
 from execution_layer.agents.data_analysis_agent import DataAnalysisAgent
-from typing import TypedDict, Dict, Any
+from typing import TypedDict, Dict, Any, Optional
 
 from execution_layer.image_utils.image_master import write_image_master_atomic, load_image_master
 from execution_layer.agents.llm_client import ENFORCED_MODEL
@@ -50,6 +50,32 @@ class MetricsState(TypedDict):
     prompt_tokens: int
     completion_tokens: int
     successful_requests: int
+    cached_tokens: int
+
+
+def _effective_remaining_token_from_payload(user_token_info: Optional[Dict[str, Any]]) -> Optional[int]:
+    """
+    Remaining tokens for legacy /analyze gate, or None to skip enforcement.
+
+    Clients sometimes send issued_token/used_token without remaining_token; treating
+    missing remaining_token as 0 incorrectly blocked users who had credits.
+    """
+    if not user_token_info:
+        return None
+    info = user_token_info
+    if "remaining_token" in info:
+        try:
+            return int(info["remaining_token"])
+        except (TypeError, ValueError):
+            return 0
+    if "issued_token" in info or "issued_tokens" in info:
+        try:
+            issued = int(info.get("issued_token", info.get("issued_tokens", 0)))
+            used = int(info.get("used_token", info.get("used_tokens", 0)))
+            return max(0, issued - used)
+        except (TypeError, ValueError):
+            return 0
+    return None
 
 class ProgressEvent:
     def __init__(self, job_id: str, stage: str, message: str, percentage: int, emoji: str = ""):
@@ -704,7 +730,8 @@ class ExecutionApi:
                     "total_tokens": 0,
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
-                    "successful_requests": 0
+                    "successful_requests": 0,
+                    "cached_tokens": 0,
                 }
                 
                 # Emit initial progress against the canonical chat job id (for Job Framework compatibility).
@@ -935,7 +962,8 @@ class ExecutionApi:
                 "total_tokens": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
-                "successful_requests": 0
+                "successful_requests": 0,
+                "cached_tokens": 0,
             }
             
             # State for QnA pipeline (no job_id needed)
@@ -1022,44 +1050,62 @@ class ExecutionApi:
             
     def calculate_costs(self, metrics: MetricsState, model_name) -> Dict[str, Any]:
         """Calculate costs based on metrics and model pricing"""
-        # Default pricing per 1K tokens
+        # Pricing per 1K tokens: {"input": $/1K, "output": $/1K}
+        # OpenAI cached tokens are billed at 50% of the input price.
+        # OpenRouter free-tier models have zero cost.
         model_pricing = {
-            "gpt-5.4": {"input": 0.002, "output": 0.008},
-            "gpt-4.1": {"input": 0.002, "output": 0.008},
-            "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
-            "gpt-4.1-mini": {"input": 0.0004, "output": 0.0016},
+            "gpt-5.4":      {"input": 0.002,   "output": 0.008},
+            "gpt-4.1":      {"input": 0.002,   "output": 0.008},
+            "gpt-4o-mini":  {"input": 0.00015, "output": 0.0006},
+            "gpt-4.1-mini": {"input": 0.0004,  "output": 0.0016},
+            # OpenRouter free tier
+            "meta-llama/llama-3.3-70b-instruct:free": {"input": 0.0, "output": 0.0},
         }
-        
+
         # Get pricing for model or use default
         pricing = model_pricing.get(model_name, {"input": 0.002, "output": 0.008})
-        
+
         try:
-            # Convert to cost per 1000 tokens
-            prompt_cost = (metrics["prompt_tokens"] / 1000) * pricing["input"]
+            cached     = metrics.get("cached_tokens", 0)
+            non_cached = max(metrics["prompt_tokens"] - cached, 0)
+
+            # Non-cached input at full price; cached input at 50% price.
+            prompt_cost     = (non_cached / 1000) * pricing["input"] \
+                            + (cached     / 1000) * pricing["input"] * 0.5
             completion_cost = (metrics["completion_tokens"] / 1000) * pricing["output"]
-            total_cost = prompt_cost + completion_cost
-            
-            print(f"Calculated costs for {model_name}: prompt=${prompt_cost:.4f}, completion=${completion_cost:.4f}, total=${total_cost:.4f}")
-            
+            total_cost      = prompt_cost + completion_cost
+            cache_savings   = (cached / 1000) * pricing["input"] * 0.5
+
+            print(
+                f"Calculated costs for {model_name}: "
+                f"prompt=${prompt_cost:.4f}, completion=${completion_cost:.4f}, "
+                f"total=${total_cost:.4f}, cache_savings=${cache_savings:.4f} "
+                f"(cached_tokens={cached})"
+            )
+
             return {
-                "prompt_cost": float(prompt_cost),
-                "completion_cost": float(completion_cost),
-                "total_cost": float(total_cost),
-                "model": model_name,
-                "prompt_tokens": metrics["prompt_tokens"],
+                "prompt_cost":       float(prompt_cost),
+                "completion_cost":   float(completion_cost),
+                "total_cost":        float(total_cost),
+                "cache_savings":     float(cache_savings),
+                "model":             model_name,
+                "prompt_tokens":     metrics["prompt_tokens"],
                 "completion_tokens": metrics["completion_tokens"],
-                "total_tokens": metrics["total_tokens"]
+                "total_tokens":      metrics["total_tokens"],
+                "cached_tokens":     cached,
             }
         except Exception as e:
             print(f"Error calculating costs: {str(e)}")
             return {
-                "prompt_cost": 0.0,
-                "completion_cost": 0.0,
-                "total_cost": 0.0,
-                "model": model_name,
-                "prompt_tokens": 0,
+                "prompt_cost":       0.0,
+                "completion_cost":   0.0,
+                "total_cost":        0.0,
+                "cache_savings":     0.0,
+                "model":             model_name,
+                "prompt_tokens":     0,
                 "completion_tokens": 0,
-                "total_tokens": 0
+                "total_tokens":      0,
+                "cached_tokens":     0,
             }
 
     def _generate_unsupported_query_report(self, user_query: str, unsupported_reason: str, query_analysis: dict) -> str:
@@ -1254,7 +1300,8 @@ class ExecutionApi:
                 "total_tokens": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
-                "successful_requests": 0
+                "successful_requests": 0,
+                "cached_tokens": 0,
             }
             
             # Clear any previous cancellation flag for this job (fresh request)
@@ -1542,11 +1589,13 @@ class ExecutionApi:
             input_dir = self._effective_job_input_dir(data, input_dir)
 
             print(f"Starting analysis for query: {user_query} using model: {model_name}")
-            print(f"📊 [TOKEN MANAGEMENT] User: {user_email}, Tokens: {user_token_info.get('used_token', 0)}/{user_token_info.get('issued_token', 0)} (remaining: {user_token_info.get('remaining_token', 0)})")
+            _rem_gate = _effective_remaining_token_from_payload(user_token_info)
+            _rem_log = _rem_gate if _rem_gate is not None else user_token_info.get("remaining_token", "n/a")
+            print(f"📊 [TOKEN MANAGEMENT] User: {user_email}, Tokens: {user_token_info.get('used_token', 0)}/{user_token_info.get('issued_token', 0)} (remaining: {_rem_log})")
             print(f"📥 [EXECUTION_API] Using input_dir: {input_dir}")
             
             # Check if user has enough tokens to proceed
-            if user_token_info and user_token_info.get('remaining_token', 0) <= 0:
+            if _rem_gate is not None and _rem_gate <= 0:
                 return jsonify({
                     "status": "error",
                     "error": "🚫 INSUFFICIENT TOKENS: User has no tokens remaining. Contact admin for more tokens.",
@@ -1554,9 +1603,9 @@ class ExecutionApi:
                     "error_code": "TOKEN_INSUFFICIENT",
                     "user_email": user_email,
                     "token_info": {
-                        "used_token": user_token_info.get('used_token', 0),
-                        "issued_token": user_token_info.get('issued_token', 0),
-                        "remaining_token": user_token_info.get('remaining_token', 0)
+                        "used_token": user_token_info.get("used_token", user_token_info.get("used_tokens", 0)),
+                        "issued_token": user_token_info.get("issued_token", user_token_info.get("issued_tokens", 0)),
+                        "remaining_token": _rem_gate,
                     },
                     "message": "Please contact administrator to purchase additional tokens."
                 }), 402  # 402 Payment Required - more appropriate for token limits
@@ -1566,7 +1615,8 @@ class ExecutionApi:
                 "total_tokens": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
-                "successful_requests": 0
+                "successful_requests": 0,
+                "cached_tokens": 0,
             }
             
             # Initialize analysis state

@@ -6,7 +6,6 @@ import re
 import base64
 from typing import List, Dict, Any
 from pathlib import Path
-from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from langchain_core.runnables import Runnable
 
@@ -19,7 +18,7 @@ from agents.analysis_mode import (
     skip_image_analysis,
 )
 from agents.token_manager import check_token_limit_internal, TokenLimitExceededException
-from agents.llm_client import ENFORCED_MODEL, vision_image_mime_subtype
+from agents.llm_client import ENFORCED_MODEL, vision_image_mime_subtype, get_async_client, get_model, llm_call
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -139,8 +138,8 @@ Keep the summary concise but informative. Structure with clear sections."""
 
 class EDAAgent(Runnable):
     def __init__(self, output_dir):
-        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = (os.getenv("MODEL_NAME") or ENFORCED_MODEL).strip() or ENFORCED_MODEL
+        self.client = get_async_client()
+        self.model = get_model()
         self.state = None
         self.output_dir = output_dir
         self.max_iterations = 3  # Dynamically overridden by analysis mode
@@ -213,9 +212,8 @@ Be concise but thorough in your analysis.
                 state["error"] = f"🚫 PROCESS STOPPED: {token_message}"
                 raise TokenLimitExceededException(token_message)
 
-            response = await self.client.responses.create(
-                model=self.model,
-                input=[
+            analysis, usage = await llm_call(
+                messages=[
                     {"role": "system", "content": VISION_SYSTEM_PROMPT},
                     {
                         "role": "user",
@@ -228,22 +226,17 @@ Be concise but thorough in your analysis.
                         ]
                     }
                 ],
-                max_output_tokens=600
+                max_output_tokens=600,
+                seed=42,
             )
 
-            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
-            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
-            state["metrics"]["total_tokens"] += (
-                getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
-            )
+            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+            state["metrics"]["completion_tokens"] += usage["output_tokens"]
+            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
             state["metrics"]["successful_requests"] += 1
+            state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
 
-            analysis = getattr(response, "output_text", None)
-            if not analysis:
-                try:
-                    analysis = response.output[0].content[0].text
-                except Exception:
-                    analysis = ""
+            analysis = analysis or ""
 
             milestone_cb = state.get("milestone_callback", lambda *a, **k: None)
             milestone_cb(
@@ -345,31 +338,24 @@ Be concise but thorough in your analysis.
     """
 
         try:
-            response = await self.client.responses.create(
-                model=self.model,
-                input=[
+            content, usage = await llm_call(
+                messages=[
                     {"role": "system", "content": EDA_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg}
+                    {"role": "user", "content": user_msg},
                 ],
-                text={"format": {"type": "json_object"}},
                 max_output_tokens=850,
+                json_response=True,
+                seed=42,
             )
 
             # Update metrics in state (existing functionality - keep as is)
-            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
-            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
-            state["metrics"]["total_tokens"] += (
-                getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
-            )
+            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+            state["metrics"]["completion_tokens"] += usage["output_tokens"]
+            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
             state["metrics"]["successful_requests"] += 1
+            state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
 
-            content = getattr(response, "output_text", None)
-            if not content:
-                try:
-                    content = response.output[0].content[0].text
-                except Exception:
-                    content = "{}"
-
+            content = content or "{}"
             # Robust JSON parsing
             result = self._safe_json(content, self._fallback_plan(user_command))
 
@@ -505,25 +491,24 @@ Is this analysis sufficient for the original request? Return valid JSON only.
 """
 
         try:
-            response = await self.client.responses.create(
-                model=self.model,
-                input=[
+            content, usage = await llm_call(
+                messages=[
                     {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
-                    {"role": "user", "content": analysis_msg}
+                    {"role": "user", "content": analysis_msg},
                 ],
-                text={"format": {"type": "json_object"}},
-                max_output_tokens=500
+                max_output_tokens=500,
+                json_response=True,
+                seed=42,
             )
 
             # Update metrics in state (existing functionality - keep as is)
-            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
-            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
-            state["metrics"]["total_tokens"] += (
-                getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
-            )
+            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+            state["metrics"]["completion_tokens"] += usage["output_tokens"]
+            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
             state["metrics"]["successful_requests"] += 1
+            state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
 
-            content = getattr(response, "output_text", "") or ""
+            content = content or ""
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
 
             if json_match:
@@ -561,29 +546,23 @@ Mode instruction: {"Keep it short and meaningful, focus on high-level insights a
 
         try:
             _syn_cap = 650 if analysis_mode == "slim" else 900
-            response = await self.client.responses.create(
-                model=self.model,
-                input=[
+            content, usage = await llm_call(
+                messages=[
                     {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
                     {"role": "user", "content": synthesis_input},
                 ],
                 max_output_tokens=_syn_cap,
+                seed=42,
             )
 
             # Update metrics in state (existing functionality - keep as is)
-            state["metrics"]["prompt_tokens"] += getattr(response.usage, "input_tokens", 0)
-            state["metrics"]["completion_tokens"] += getattr(response.usage, "output_tokens", 0)
-            state["metrics"]["total_tokens"] += (
-                getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
-            )
+            state["metrics"]["prompt_tokens"] += usage["input_tokens"]
+            state["metrics"]["completion_tokens"] += usage["output_tokens"]
+            state["metrics"]["total_tokens"] += usage["input_tokens"] + usage["output_tokens"]
             state["metrics"]["successful_requests"] += 1
+            state["metrics"]["cached_tokens"] += usage.get("cached_tokens", 0)
 
-            content = getattr(response, "output_text", None)
-            if not content:
-                try:
-                    content = response.output[0].content[0].text
-                except Exception:
-                    content = ""
+            content = content or ""
             milestone_cb("EDA: LLM synthesis done", "eda_synthesis_llm_done", {"dependency": "sequential", "is_llm_call": True})
             return content
             
